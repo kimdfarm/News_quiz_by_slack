@@ -99,10 +99,7 @@ DEFAULT_PRESS_RSS_MAP: Dict[str, Dict[str, Any]] = {
         "urls": ["https://www.chosun.com/arc/outboundfeeds/rss/?outputType=xml"],
         "category": "종합",
     },
-    "동아일보/경제": {
-        "urls": ["https://rss.donga.com/economy.xml"],
-        "category": "경제",
-    },
+    
     "SBS/뉴스": {
         "urls": ["https://news.sbs.co.kr/news/headlineRssFeed.do?plink=RSSREADER"],
         "category": "종합",
@@ -129,12 +126,104 @@ DEFAULT_PRESS_RSS_MAP: Dict[str, Dict[str, Any]] = {
     # --- 주요 일간지 추가 섹션 ---
     "조선/국제": {
         "urls": ["https://www.chosun.com/arc/outboundfeeds/rss/category/international/?outputType=xml"],
-        "category": "세계",
+        "category": "국제",
     },
+    # --- 동아일보  ---
     "동아/전체": {
-        "urls": ["https://rss.donga.com/"],
+        "urls": ["https://rss.donga.com/total.xml"],
         "category": "종합",
     },
+    
+    "동아/정치": {
+            "urls": ["https://rss.donga.com/politics.xml"],
+            "category": "정치",
+        },
+    "동아/사회": {
+                "urls": ["https://rss.donga.com/national.xml"],
+                "category": "사회",
+            },
+    "동아/경제": {
+            "urls": ["https://rss.donga.com/economy.xml"],
+            "category": "경제",
+        },
+    "동아/국제": {
+                "urls": ["https://rss.donga.com/international.xml"],
+                "category": "국제",
+            },
+    "동아/사설칼럼": {
+                    "urls": ["https://rss.donga.com/editorials.xml"],
+                    "category": "사설/칼럼",
+                },
+    "동아/의학과학": {
+                        "urls": ["https://rss.donga.com/science.xml"],
+                        "category": "의학과학",
+                    },
+    "동아/문화연예": {
+                            "urls": ["https://rss.donga.com/culture.xml"],
+                            "category": "문화연예",
+                        },
+    "동아/스포츠": {
+                            "urls": ["https://rss.donga.com/sports.xml"],
+                            "category": "스포츠",
+                        },
+    "동아/사람속으로": {
+                            "urls": ["https://rss.donga.com/inmul.xml"],
+                            "category": "사람속으로",
+                        },
+    "동아/건강": {
+                            "urls": ["https://rss.donga.com/health.xml"],
+                            "category": "건강",
+                        },
+    "동아/도서": {
+                            "urls": ["https://rss.donga.com/book.xml"],
+                            "category": "도서",
+                        },
+    "동아/공연": {
+                            "urls": ["https://rss.donga.com/show.xml"],
+                            "category": "공연",
+                        },
+    "동아/여성": {
+                            "urls": ["https://rss.donga.com/woman.xml"],
+                            "category": "여성",
+                        },
+    "동아/여행": {
+                            "urls": ["https://rss.donga.com/travel.xml"],
+                            "category": "여행",
+                        },
+    "동아/생활정보": {
+                            "urls": ["https://rss.donga.com/lifeinfo.xml"],
+                            "category": "생활정보",
+                        },
+    "동아/스포츠": {
+                            "urls": ["https://rss.donga.com/sportsdonga/sports.xml"],
+                            "category": "스포츠",
+                        },
+    "동아/야구/MLB": {
+                            "urls": ["https://rss.donga.com/sportsdonga/baseball.xml"],
+                            "category": "야구/MLB",
+                        },
+    "동아/축구": {
+                            "urls": ["https://rss.donga.com/sportsdonga/soccer.xml"],
+                            "category": "축구",
+                        },
+    "동아/골프": {
+                            "urls": ["https://rss.donga.com/sportsdonga/golf.xml"],
+                            "category": "골프",
+                        },
+    "동아/스포츠_일반": {
+                            "urls": ["https://rss.donga.com/sportsdonga/sports_general.xml"],
+                            "category": "스포츠_일반",
+                        },
+    "동아/e스포츠/게임": {
+                            "urls": ["https://rss.donga.com/sportsdonga/sports_game.xml"],
+                            "category": "e스포츠/게임",
+                        },
+    "동아/엔터테인먼트": {
+                            "urls": ["https://rss.donga.com/sportsdonga/entertainment.xml"],
+                            "category": "엔터테인먼트",
+                        },
+
+        
     
     
 }
