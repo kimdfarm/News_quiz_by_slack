@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 try:
     from crawler.news.rss_sources import build_sources_config, load_press_rss_map
     from crawler.news.storage_mode_config import (
