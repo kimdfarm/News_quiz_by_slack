@@ -258,21 +258,63 @@ def _parse_pub_date(raw_date: Optional[str], entry=None) -> datetime:
 
     return datetime.now()
 
-
 def _fetch_xml_bytes(rss_url: str) -> Optional[bytes]:
+    headers = {
+        **DEFAULT_HEADERS,
+        "Referer": "https://www.hankyung.com/feed",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "DNT": "1",
+    }
+
+    # 1) requests.Session 시도
+    last_err: Optional[Exception] = None
     try:
-        resp = requests.get(rss_url, headers=DEFAULT_HEADERS, timeout=15, allow_redirects=True)
+        with requests.Session() as sess:
+            resp = sess.get(rss_url, headers=headers, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.content
+    except Exception as e:
+        last_err = e
+
+    # 2) cloudscraper 폴백 (설치된 경우)
+    try:
+        import cloudscraper  # type: ignore
+
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True}
+        )
+        resp = scraper.get(rss_url, timeout=15)
         resp.raise_for_status()
         return resp.content
+    except ImportError:
+        pass
     except Exception as e:
-        print(f"  [!] RSS HTTP 요청 실패 ({rss_url}): {e}", file=sys.stderr)
-        return None
+        last_err = e
 
+    # 3) curl_cffi 폴백 (설치된 경우)
+    try:
+        from curl_cffi import requests as cffi_requests  # type: ignore
+
+        resp = cffi_requests.get(rss_url, impersonate="chrome124", timeout=15)
+        resp.raise_for_status()
+        return resp.content
+    except ImportError:
+        pass
+    except Exception as e:
+        last_err = e
+
+    print(f"  [!] RSS HTTP 요청 실패 ({rss_url}): {last_err}", file=sys.stderr)
+    return None
 
 def parse_rss_items(rss_url: str) -> List[dict]:
     raw_xml = _fetch_xml_bytes(rss_url)
-    items: List[dict] = []
+    if not raw_xml:
+        return []
 
+    items: List[dict] = []
     feed = feedparser.parse(raw_xml) if raw_xml else feedparser.parse(rss_url)
     for entry in (getattr(feed, "entries", []) or []):
         title = _clean_text(entry.get("title")) or "제목 없음"
