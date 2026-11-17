@@ -1,29 +1,64 @@
-import os
 import json
+import os
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from database import get_db_connection, clean_old_news
+from database import clean_old_news, get_db_connection
 
 DEFAULT_SQLITE_PATH = os.getenv("NEWS_SQLITE_PATH", "news_store.sqlite")
+STATE_FILE_PATH = Path(__file__).resolve().parent.parent / "storage_mode_state.json"
 
 
 def normalize_storage_backend(backend: Optional[str]) -> str:
     val = (backend or "").strip().lower()
-    if val in ("sqlite", "file", "local_file", "sq"):
+    if val in ("sqlite", "file", "local_file", "sq", "로컬", "파일"):
         return "sqlite"
-    if val in ("postgres", "postgresql", "db", "pg"):
+    if val in ("postgres", "postgresql", "db", "pg", "neon", "neondb", "네온", "디비"):
         return "postgres"
-    raise ValueError(f"지원하지 않는 STORAGE_BACKEND 값입니다: {backend} (사용 가능: postgres, sqlite)")
+    raise ValueError(
+        f"지원하지 않는 STORAGE_BACKEND 값입니다: {backend} (사용 가능: postgres, sqlite)"
+    )
+
+
+def _read_state_file() -> Optional[str]:
+    try:
+        if STATE_FILE_PATH.exists():
+            data = json.loads(STATE_FILE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("storage_mode"):
+                return normalize_storage_backend(str(data["storage_mode"]))
+    except Exception:
+        pass
+    return None
+
+
+def _write_state_file(normalized: str) -> None:
+    STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "storage_mode": normalized,
+        "updated_at": datetime.now().isoformat(),
+    }
+    STATE_FILE_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def get_active_storage_backend() -> str:
+    from_file = _read_state_file()
+    if from_file:
+        return from_file
+
     current = (os.getenv("STORAGE_BACKEND") or "postgres").strip().lower()
-    return "sqlite" if current in ("sqlite", "file", "local_file", "sq") else "postgres"
+    try:
+        return normalize_storage_backend(current)
+    except ValueError:
+        return "postgres"
 
 
 def set_active_storage_backend(backend: str) -> str:
     normalized = normalize_storage_backend(backend)
+    _write_state_file(normalized)
     os.environ["STORAGE_BACKEND"] = normalized
     return normalized
 
