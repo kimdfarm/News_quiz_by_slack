@@ -354,6 +354,7 @@ def _extract_html_with_bs4(html_text: str) -> str:
 
 def fetch_article_details(url: str) -> dict:
     result = {"raw_content": "", "author": "", "thumbnail": "", "final_url": url}
+    
     if not url:
         return result
 
@@ -361,6 +362,10 @@ def fetch_article_details(url: str) -> dict:
         response = requests.get(url, headers=DEFAULT_HEADERS, timeout=15, allow_redirects=True)
         result["final_url"] = response.url or url
         if response.status_code != 200:
+            print(
+                f"    [debug] status={response.status_code} url={result['final_url']} len=0",
+                file=sys.stderr,
+            )
             return result
 
         if not response.encoding or response.encoding.lower() in ("iso-8859-1", "windows-1252"):
@@ -381,15 +386,59 @@ def fetch_article_details(url: str) -> dict:
             result["thumbnail"] = (data.get("image") or "").strip()
 
         if len(result["raw_content"]) < 80:
-            bs_text = _extract_html_with_bs4(html_text)
-            if len(bs_text) > len(result["raw_content"]):
-                result["raw_content"] = bs_text
+            arc_text = _extract_arc_fusion_content(html_text)
+            if len(arc_text) > len(result["raw_content"]):
+                result["raw_content"] = arc_text
 
+        print(
+            f"    [debug] status={response.status_code} url={result['final_url']} len={len(result['raw_content'])}",
+            file=sys.stderr,
+        )
         return result
     except Exception as e:
+        print(f"    [debug] request_error url={result['final_url']} err={e}", file=sys.stderr)
         print(f"  [!] 본문 스크래핑 실패 ({url}): {e}", file=sys.stderr)
         return result
 
+def _extract_arc_fusion_content(html_text: str) -> str:
+    """조선일보 등 Arc Publishing(<script id='fusion-metadata'>) JSON에서 본문 텍스트를 추출합니다."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    script_tag = soup.find("script", id="fusion-metadata")
+    script_body = script_tag.string or script_tag.get_text() if script_tag else html_text
+
+    marker = "Fusion.globalContent="
+    idx = script_body.find(marker)
+    if idx == -1:
+        marker = "Fusion.globalContent ="
+        idx = script_body.find(marker)
+    if idx == -1:
+        return ""
+
+    json_start = script_body.find("{", idx)
+    if json_start == -1:
+        return ""
+
+    try:
+        decoder = json.JSONDecoder()
+        data, _ = decoder.raw_decode(script_body, json_start)
+    except Exception:
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+
+    paragraphs: List[str] = []
+    for el in data.get("content_elements") or []:
+        if not isinstance(el, dict):
+            continue
+        el_type = el.get("type")
+        if el_type in ("text", "raw_html", "header"):
+            raw = el.get("content") or ""
+            clean = _clean_text(BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
+            if clean:
+                paragraphs.append(clean)
+
+    return "\n".join(paragraphs)
 
 def _build_default_analysis(title: str, raw_content: str, category: str) -> dict:
     clean_text = (raw_content or title or "").strip()
@@ -721,22 +770,30 @@ def crawl_and_save_rss(
     print(f"[{source_name}] ({mode}) 총 {total_count}건 처리 완료!",file=sys.stderr)
     return total_count
 
-
+from typing import Callable, List, Optional, Union
 def crawl_multiple_rss_sources(
     sources_config: List[dict],
     limit: Optional[int] = None,
     storage_mode: Optional[str] = None,
     sqlite_path: str = DEFAULT_SQLITE_PATH,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> int:
     grand_total = 0
-    for cfg in sources_config:
+    total_sources = len(sources_config)
+
+    for idx, cfg in enumerate(sources_config, start=1):
+        source_name = cfg["source_name"]
+        category = cfg.get("category", "종합")
+        if on_progress:
+            on_progress(f"{source_name}/{category} 수집 중 ({idx}/{total_sources})")
+
         effective_limit = cfg.get("limit") if cfg.get("limit") is not None else limit
         effective_mode = cfg.get("storage_mode") or storage_mode
         effective_sqlite = cfg.get("sqlite_path") or sqlite_path
         grand_total += crawl_and_save_rss(
             rss_urls=cfg["rss_urls"],
-            category=cfg.get("category", "종합"),
-            source_name=cfg["source_name"],
+            category=category,
+            source_name=source_name,
             limit=effective_limit,
             storage_mode=effective_mode,
             sqlite_path=effective_sqlite,
