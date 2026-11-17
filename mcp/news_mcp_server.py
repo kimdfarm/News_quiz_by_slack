@@ -222,8 +222,181 @@ def get_storage_status(sqlite_path: Optional[str] = None) -> str:
         ensure_ascii=False,
     )
 
+@mcp.tool()
+def get_storage_stats(
+    target_backend: Optional[str] = None,
+    sqlite_path: Optional[str] = None,
+) -> str:
+    """현재 또는 지정된 저장소(sqlite / postgres)의 기사 통계(총 건수, 언론사별/분야별 건수, 최근 수집 시각)를 반환합니다."""
+    import sqlite3
+    from storage_backend import (
+        DEFAULT_SQLITE_PATH as BACKEND_DEFAULT_SQLITE,
+        get_active_storage_backend,
+        normalize_storage_backend,
+    )
 
+    active_mode = get_active_storage_backend()
+    if target_backend and str(target_backend).strip():
+        chosen_mode = normalize_storage_backend(target_backend)
+    else:
+        chosen_mode = active_mode
 
+    if chosen_mode == "sqlite":
+        db_file = os.path.abspath(
+            (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or BACKEND_DEFAULT_SQLITE).strip()
+        )
+        if not os.path.isfile(db_file):
+            return json.dumps(
+                {
+                    "status": "unavailable",
+                    "backend": "sqlite",
+                    "active_backend": active_mode,
+                    "message": "SQLite 저장소가 아직 준비되지 않았어요.",
+                },
+                ensure_ascii=False,
+            )
+
+        conn = sqlite3.connect(db_file)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT COUNT(*) FROM news_perspectives;")
+            total_count = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                """
+                SELECT COALESCE(s.name, '미상') AS src, COUNT(*) AS cnt
+                FROM news_perspectives p
+                LEFT JOIN sources s ON p.source_id = s.id
+                GROUP BY src
+                ORDER BY cnt DESC
+                LIMIT 5;
+                """
+            )
+            by_source = [{"name": r[0], "count": int(r[1])} for r in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT COALESCE(c.name, '미분류') AS cat, COUNT(*) AS cnt
+                FROM news_perspectives p
+                LEFT JOIN news_issues i ON p.issue_id = i.id
+                LEFT JOIN categories c ON i.category_id = c.id
+                GROUP BY cat
+                ORDER BY cnt DESC
+                LIMIT 5;
+                """
+            )
+            by_category = [{"name": r[0], "count": int(r[1])} for r in cur.fetchall()]
+
+            cur.execute(
+            """
+            SELECT
+                MIN(COALESCE(published_at, created_at)),
+                MAX(COALESCE(published_at, created_at))
+            FROM news_perspectives;
+            """
+        )
+            oldest_at, latest_at = cur.fetchone()
+        finally:
+            cur.close()
+            conn.close()
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "backend": "sqlite",
+                "active_backend": active_mode,
+                "total_count": total_count,
+                "by_source": by_source,
+                "by_category": by_category,
+                "latest_published_at": str(latest_at) if latest_at else None,
+                "oldest_published_at": str(oldest_at) if oldest_at else None,
+            },
+            ensure_ascii=False,
+        )
+
+    # postgres
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    if not db_url:
+        return json.dumps(
+            {
+                "status": "unavailable",
+                "backend": "postgres",
+                "active_backend": active_mode,
+                "message": "Neon DB(PostgreSQL) 연결 정보가 설정되지 않았어요.",
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        from database import get_db_connection
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT COUNT(*) FROM news_perspectives;")
+            total_count = int(cur.fetchone()[0] or 0)
+
+            cur.execute(
+                """
+                SELECT COALESCE(s.name, '미상') AS src, COUNT(*) AS cnt
+                FROM news_perspectives p
+                LEFT JOIN sources s ON p.source_id = s.id
+                GROUP BY src
+                ORDER BY cnt DESC
+                LIMIT 5;
+                """
+            )
+            by_source = [{"name": r[0], "count": int(r[1])} for r in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT COALESCE(c.name, '미분류') AS cat, COUNT(*) AS cnt
+                FROM news_perspectives p
+                LEFT JOIN news_issues i ON p.issue_id = i.id
+                LEFT JOIN categories c ON i.category_id = c.id
+                GROUP BY cat
+                ORDER BY cnt DESC
+                LIMIT 5;
+                """
+            )
+            by_category = [{"name": r[0], "count": int(r[1])} for r in cur.fetchall()]
+
+            cur.execute(
+            """
+            SELECT
+                MIN(COALESCE(published_at::text, created_at::text)),
+                MAX(COALESCE(published_at::text, created_at::text))
+            FROM news_perspectives;
+            """
+        )
+            oldest_at, latest_at = cur.fetchone()
+        finally:
+            cur.close()
+            conn.close()
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "backend": "postgres",
+                "active_backend": active_mode,
+                "total_count": total_count,
+                "by_source": by_source,
+                "by_category": by_category,
+                "oldest_published_at": str(oldest_at) if oldest_at else None,
+                "latest_published_at": str(latest_at) if latest_at else None,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        return json.dumps(
+            {
+                "status": "error",
+                "backend": "postgres",
+                "active_backend": active_mode,
+                "message": f"Neon DB 조회 실패: {e}",
+            },
+            ensure_ascii=False,
+        )
 
 
 

@@ -52,6 +52,7 @@ from crawler.news.plan_sources_from_request import (
 from storage_backend import (
     DEFAULT_SQLITE_PATH,
     get_active_storage_backend,
+    normalize_storage_backend,
 )
 
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
@@ -76,6 +77,10 @@ MCP_TOOL_CATALOG = [
     {
         "tool": "get_storage_status",
         "description": "현재 저장소 설정과 SQLite / Postgres 연결·파일 상태를 조회한다.",
+    },
+    {
+        "tool": "get_storage_stats",
+        "description": "현재 또는 지정 저장소(sqlite / postgres)의 기사 수 및 언론사/분야별 통계를 조회한다.",
     },
     {
         "tool": "none",
@@ -212,6 +217,7 @@ def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
         "- RSS 수집/크롤링/기사 모아줘/기사 수집해줘 요청 -> run_rss_by_request\n"
         "- 퀴즈/문제 출제 요청 -> get_recent_news_for_quiz\n"
         "- 저장소 상태/DB 상태/SQLite 상태/연결 상태 조회 요청(예: '저장소 상태 확인해줘', 'DB 연결 상태 보고해줘', '현재 어디에 저장 중이지?') -> get_storage_status\n"
+        "- 저장소 통계/기사 건수/언론사별·분야별 현황 조회 요청(예: '저장된 정보 통계 보여줘', '몇 건 쌓였어?', '통계 알려줘', '기사 수 확인해줘') -> get_storage_stats"
         "- 그 외 모든 요청 -> none"
     )
 
@@ -221,6 +227,7 @@ def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
         "export_sqlite_file",
         "get_recent_news_for_quiz",
         "get_storage_status",
+        "get_storage_stats",
         "none",
     }
 
@@ -409,6 +416,79 @@ def handle_mention(event, say,client):
             )
         )
         return
+
+    if tool == "get_storage_stats":
+        lowered = user_text.lower()
+        if any(k in lowered for k in ("sqlite", "로컬", "파일")) and not any(
+            k in lowered for k in ("postgres", "neon", "네온", "db", "디비")
+        ):
+            target_backend = "sqlite"
+        elif any(k in lowered for k in ("postgres", "neon", "네온", "db", "디비")):
+            target_backend = "postgres"
+        else:
+            target_backend = None
+
+        raw_res = mcp_tools.get_storage_stats(
+            target_backend=target_backend,
+            sqlite_path=DEFAULT_SQLITE_PATH,
+        )
+        data = json.loads(raw_res)
+
+        backend = (data.get("backend") or "미확인").strip().lower()
+        backend_label = (
+            f"`{backend}` (파일 저장중)"
+            if backend == "sqlite"
+            else f"`{backend}` (neon db로 저장중)"
+            if backend == "postgres"
+            else f"`{backend}`"
+        )
+
+        if data.get("status") != "ok":
+            say(
+                text=(
+                    f"📈 *저장소 통계*\n"
+                    f"• 대상 저장소: {backend_label}\n"
+                    f"• 상태: {data.get('message') or '통계를 불러올 수 없어요.'}"
+                )
+            )
+            return
+
+        by_source = data.get("by_source") or []
+        by_category = data.get("by_category") or []
+
+        src_text = (
+            ", ".join(f"{x['name']} {x['count']}건" for x in by_source)
+            if by_source
+            else "데이터 없음"
+        )
+        cat_text = (
+            ", ".join(f"{x['name']} {x['count']}건" for x in by_category)
+            if by_category
+            else "데이터 없음"
+        )
+        oldest = data.get("oldest_published_at") or "없음"
+        latest = data.get("latest_published_at") or "없음"
+        if oldest and latest:
+            period_text = f"`{oldest}` ~ `{latest}`"
+        elif latest:
+            period_text = f"`{latest}`"
+        elif oldest:
+            period_text = f"`{oldest}`"
+        else:
+            period_text = "없음"
+
+        say(
+            text=(
+                f"📈 *저장소 통계*\n"
+                f"• 대상 저장소: {backend_label}\n"
+                f"• 총 기사 수: *{data.get('total_count', 0)}건*\n"
+                f"• 언론사별(상위): {src_text}\n"
+                f"• 분야별(상위): {cat_text}\n"
+                f"• 기사 기간: {period_text}"
+            )
+        )
+        return
+
 
     say(text="그런 기능은 없어요.")
 
