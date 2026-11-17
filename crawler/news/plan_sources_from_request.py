@@ -2,8 +2,9 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
+from langchain_groq import ChatGroq
 import requests
 from dotenv import load_dotenv
 
@@ -23,40 +24,38 @@ except ImportError:
     )
 
 
-PRESS_SYNONYMS: Dict[str, List[str]] = {
-    "연합": ["연합", "연합뉴스", "연합뉴스tv", "yonhap"],
-    "경향": ["경향", "경향신문", "khan"],
-    "한경": ["한경", "한국경제", "hankyung"],
-    "매경": ["매경", "매일경제", "mk"],
-    "조선": ["조선", "조선일보", "chosun"],
-    "조선일보": ["조선일보", "조선", "chosun"],
-    "조선비즈": ["조선비즈", "조선비즈/전체", "비즈", "biz"],
-    "조세일보": ["조세일보", "조세", "세무"],
-    "동아": ["동아", "동아일보", "donga"],
-    "동아일보": ["동아일보", "동아", "donga"],
-    "한겨레": ["한겨레", "한겨레신문", "hani"],
-    "sbs": ["sbs", "에스비에스", "sbs뉴스"],
-    "뉴시스": ["뉴시스", "newsis"],
-    "aitimes": ["aitimes", "ai타임스", "에이아이타임스"],
-    "전자신문": ["전자신문", "etnews", "전자"],
-    "테크m": ["테크m", "테크엠", "techm"],
-}
+def parse_help_topic(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    cleaned = text.strip().lower()
+    if "--help" not in cleaned and cleaned not in ("-h", "help", "도움말", "가이드"):
+        return None
+    if re.search(r"\b--?incoder\b", cleaned) or "incoder" in cleaned:
+        return "incoder"
+    if re.search(r"\b--?decoder\b", cleaned) or "decoder" in cleaned:
+        return "decoder"
+    return "index"
 
-CATEGORY_SYNONYMS: Dict[str, List[str]] = {
-    "종합": ["종합", "전체", "헤드라인", "메인"],
-    "경제": ["경제", "금융", "증시", "거시", "경기"],
-    "정치": ["정치", "국회", "대통령", "외교", "여야", "선거"],
-    "사회": ["사회", "사건", "사고", "교육", "노동", "복지", "지역"],
-    "세계": ["세계", "국제", "해외", "글로벌", "외신"],
-    "산업_it": ["산업_it", "it/산업", "산업", "it", "테크", "기술"],
-    "it_과학": ["it_과학", "it/과학", "과학", "it", "테크", "연구"],
-    "it": ["it", "it/테크", "테크", "기술", "모바일"],
-    "기업_경영": ["기업_경영", "기업/산업", "기업", "경영", "재계", "인사"],
-    "ai/테크": ["ai/테크", "ai", "인공지능", "테크", "llm", "모델"],
-    "경제/산업": ["경제/산업", "경제", "산업", "비즈"],
-    "경제/세무": ["경제/세무", "세무", "조세", "세금", "경제"],
-    "속보": ["속보", "긴급", "실시간"],
-}
+
+def get_rss_crawling_guide(topic: Optional[str] = "index") -> str:
+    target = (topic or "index").strip().lower()
+    if target == "incoder":
+        return (
+            "*[--incoder --help] RSS 데이터 추출 및 저장 모드 도움말*\n"
+            "• 자연어로 언론사/분야/개수를 적으면 등록된 RSS 목록 기준으로 추론 수집합니다.\n"
+            "• 저장소 전환: `앞으로 sqlite로 저장해줘` / `다시 db로 바꿔줘` (`storage_mode_state.json`에 저장)\n"
+            "• 등록된 소스 중 일부가 없어도 가능한 항목만 수집하고 미지원 항목을 함께 안내합니다."
+        )
+    if target == "decoder":
+        return (
+            "*[--decoder --help] 문제 템플릿 출력 방식 가이드*\n"
+            "• 저장된 뉴스의 사실·관점·키워드 데이터를 바탕으로 퀴즈 템플릿을 생성·출력합니다."
+        )
+    return (
+        "*Slack 봇 도움말*\n"
+        "• `--incoder --help`  # RSS 데이터 추출 방법 및 저장 모드 도움말\n"
+        "• `--decoder --help`  # 문제 템플릿 출력 방식 도움말"
+    )
 
 
 def _get_groq_model_queue() -> List[str]:
@@ -93,128 +92,89 @@ def _extract_json_block(raw_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _infer_default_limit(text: str) -> int:
-    if any(k in text for k in ("가볍게", "몇 개", "살짝", "테스트", "빠르게", "요약만")):
-        return 3
-    if any(k in text for k in ("넉넉히", "많이", "듬뿍")):
-        return 15
-    return 5
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage
 
-
-def _build_dynamic_index(
-    press_map: Dict[str, Dict[str, Any]],
-) -> List[Tuple[str, str, List[str], List[str]]]:
-    """
-    press_map의 각 항목을 (source_name, category_label, press_tokens, cat_tokens) 형태로 인덱싱합니다.
-    """
-    indexed: List[Tuple[str, str, List[str], List[str]]] = []
-    for src_name, info in press_map.items():
-        cat_label = str(info.get("category") or "종합").strip()
-        press_part = src_name.split("/", 1)[0].strip() if "/" in src_name else src_name.strip()
-        sec_part = src_name.split("/", 1)[1].strip() if "/" in src_name else ""
-
-        p_tokens = {src_name.lower(), press_part.lower()}
-        for syn_key, syn_list in PRESS_SYNONYMS.items():
-            lower_syns = [s.lower() for s in syn_list]
-            if press_part.lower() in lower_syns or src_name.lower() in lower_syns or syn_key.lower() == press_part.lower():
-                p_tokens.update(lower_syns)
-
-        c_tokens = {cat_label.lower()}
-        if sec_part:
-            c_tokens.add(sec_part.lower())
-            c_tokens.add(sec_part.replace("_", "/").lower())
-            c_tokens.add(sec_part.replace("_", " ").lower())
-            c_tokens.add(sec_part.split("_", 1)[0].lower())
-
-        for raw_c in (cat_label.lower(), sec_part.lower()):
-            if not raw_c:
-                continue
-            if raw_c in CATEGORY_SYNONYMS:
-                c_tokens.update(s.lower() for s in CATEGORY_SYNONYMS[raw_c])
-            for syn_key, syn_list in CATEGORY_SYNONYMS.items():
-                lower_syns = [s.lower() for s in syn_list]
-                if raw_c in lower_syns or syn_key.lower() == raw_c:
-                    c_tokens.update(lower_syns)
-
-        indexed.append((
-            src_name,
-            cat_label,
-            [t for t in p_tokens if t],
-            [t for t in c_tokens if t],
-        ))
-    return indexed
-
-
-def _fallback_parse_request(
+def _infer_llm_plan(
     request_text: str,
-    press_map: Dict[str, Dict[str, Any]],
-    effective_mode: str,
-    sqlite_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    text = (request_text or "").strip()
-    base_default_limit = _infer_default_limit(text)
+    available_summary: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    system_prompt = (
+        "당신은 RSS 뉴스 수집 요청 추론기입니다. 제공된 '등록된 언론사-RSS 목록'만 기준으로 "
+        "사용자의 자연어 요청을 해석하고 유효한 JSON만 출력하세요.\n"
+        "출력 스키마:\n"
+        "{\n"
+        '  "default_limit": 5,\n'
+        '  "configs": [\n'
+        '    {"source_name": "목록의 정확한 source_name", "category": "카테고리", "rss_urls": ["https://..."], "limit": 3}\n'
+        "  ],\n"
+        '  "unsupported_items": ["목록에 없어 RSS로 제공할 수 없는 요청 항목"]\n'
+        "}\n"
+        "추론 규칙:\n"
+        "1. 애매하거나 구어체·약칭·유사 표현(예: '해외 소식 살짝', '조선일보 국제', 'AI 뉴스 몇 개')이라도 "
+        "등록된 목록의 source_name/category와 의미가 이어지면 합리적으로 매칭하세요.\n"
+        "2. '모든 언론사/전체 언론사'처럼 전체를 명시할 때만 목록 전체를 configs에 넣으세요.\n"
+        "3. 사용자가 요청한 항목 중 등록된 RSS 목록에 없는 분야/언론사/주제(예: 날씨, 스포츠, 증시 라이브 등)는 "
+        "억지로 매칭하지 말고 'unsupported_items'에 넣으세요.\n"
+        "4. 요청 전체가 RSS 뉴스 수집과 무관하거나 지원 불가 항목뿐이면 'configs'를 []로 두고 "
+        "'unsupported_items'에 해당 요청 내용을 넣으세요.\n"
+        "5. 개수 언급이 없으면 문맥상 가벼운 요청은 3, 일반 요청은 5, 많은 요청은 10~15 정도로 정하세요."
+    )
 
-    if any(kw in text for kw in ("전체 언론사", "모든 언론사", "전부 수집", "전체 수집")):
-        num_match = re.search(r"(\d+)\s*개", text)
-        limit = int(num_match.group(1)) if num_match else base_default_limit
-        configs = build_sources_config(
-            press_names=None,
-            limit=limit,
-            storage_mode=effective_mode,
-            sqlite_path=sqlite_path,
-        )
-        return {"storage_mode": effective_mode, "default_limit": limit, "configs": configs}
+    user_prompt = (
+        f"등록된 언론사-RSS 목록:\n{json.dumps(available_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"사용자 요청: {request_text}"
+    )
 
-    indexed = _build_dynamic_index(press_map)
-    segments = [seg.strip() for seg in re.split(r"[,，\n]+", text) if seg.strip()]
-    configs: List[Dict[str, Any]] = []
-    seen_sources = set()
+    plan_max_tokens = int(os.getenv("PLAN_MAX_TOKENS", "700"))
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+    groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
 
-    for seg in segments:
-        seg_lower = seg.lower()
-        num_match = re.search(r"(\d+)\s*개", seg)
-        seg_limit = int(num_match.group(1)) if num_match else base_default_limit
-
-        matched_sources: List[str] = []
-
-        # 1) 세그먼트 내 언론사 토큰과 분야/카테고리 토큰이 함께 일치하는 항목 우선 매칭
-        for src_name, _, p_tokens, c_tokens in indexed:
-            has_press = any(pt in seg_lower for pt in p_tokens)
-            has_cat = any(ct in seg_lower for ct in c_tokens)
-            if has_press and has_cat:
-                matched_sources.append(src_name)
-
-        # 2) 언론사만 언급된 경우: 해당 언론사의 대표(종합/전체/첫 번째) 항목 선택
-        if not matched_sources:
-            for src_name, _, p_tokens, _ in indexed:
-                if any(pt in seg_lower for pt in p_tokens):
-                    matched_sources.append(src_name)
-                    break
-
-        # 3) 언론사명 없이 분야/카테고리 키워드만 언급된 경우
-        if not matched_sources:
-            for src_name, _, _, c_tokens in indexed:
-                if any(ct in seg_lower for ct in c_tokens):
-                    matched_sources.append(src_name)
-
-        for mk in matched_sources:
-            if mk not in seen_sources:
-                seen_sources.add(mk)
-                configs.extend(
-                    build_sources_config(
-                        press_names=[mk],
-                        limit=seg_limit,
-                        storage_mode=effective_mode,
-                        sqlite_path=sqlite_path,
-                    )
+    if groq_api_key:
+        for model_name in _get_groq_model_queue():
+            try:
+                llm = ChatGroq(
+                    model=model_name,
+                    api_key=groq_api_key,
+                    temperature=0.1,
+                    max_tokens=plan_max_tokens,
                 )
+                resp = llm.invoke(messages)
+                raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+                parsed = _extract_json_block(raw)
+                if parsed and isinstance(parsed.get("configs"), list):
+                    return parsed
+            except Exception as e:
+                print(f"[!] plan_sources Groq({model_name}) 실패: {e}", file=sys.stderr)
+        return None
 
-    default_limit = configs[0]["limit"] if configs else base_default_limit
-    return {
-        "storage_mode": effective_mode,
-        "default_limit": default_limit,
-        "configs": configs,
-    }
+    ollama_model = (os.getenv("OLLAMA_MODEL") or "gemma3:4b").strip()
+    ollama_base_url = (os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").strip()
+    try:
+        ollama_llm = ChatOllama(
+            model=ollama_model,
+            base_url=ollama_base_url,
+            temperature=0.1,
+        )
+        resp = ollama_llm.invoke(messages)
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        parsed = _extract_json_block(raw)
+        if parsed and isinstance(parsed.get("configs"), list):
+            return parsed
+    except Exception as e:
+        print(f"[!] plan_sources Ollama({ollama_model}) 호출 실패: {e}", file=sys.stderr)
+
+    return None
+
+def _build_status_message(configs: List[Dict[str, Any]], unsupported_items: List[str]) -> str:
+    unsupported_clean = [str(x).strip() for x in (unsupported_items or []) if str(x).strip()]
+    if not configs and unsupported_clean:
+        return f"요청하신 항목({', '.join(unsupported_clean)})은 RSS가 제공하지 않아 수집을 실행하지 않습니다."
+    if not configs:
+        return "요청하신 내용에 맞는 RSS 소스를 찾지 못해 수집을 실행하지 않습니다."
+    if unsupported_clean:
+        return f"일부분({', '.join(unsupported_clean)})은 RSS가 제공하지 않습니다. 가능한 항목만 수집합니다."
+    return ""
 
 
 def plan_sources_from_request(
@@ -222,24 +182,31 @@ def plan_sources_from_request(
     storage_mode: Optional[str] = None,
     sqlite_path: Optional[str] = None,
 ) -> Dict[str, Any]:
+    help_topic = parse_help_topic(request_text)
+    if help_topic:
+        return {
+            "help": True,
+            "topic": help_topic,
+            "guide": get_rss_crawling_guide(help_topic),
+            "configs": [],
+            "unsupported_items": [],
+            "message": "",
+        }
+
     effective_mode = resolve_storage_mode_for_request(
         request_text=request_text,
         explicit_storage_mode=storage_mode,
         persist_command=True,
     )
-    if is_help_request(request_text):
-        return {
-            "help": True,
-            "guide": get_rss_crawling_guide(),
-            "configs": [],
-        }
 
     if is_mode_only_request(request_text):
         return {
             "storage_mode": effective_mode,
-            "default_limit": _infer_default_limit(request_text or ""),
+            "default_limit": 5,
             "mode_updated": True,
             "configs": [],
+            "unsupported_items": [],
+            "message": "",
         }
 
     press_map = load_press_rss_map()
@@ -252,117 +219,60 @@ def plan_sources_from_request(
         for name, info in press_map.items()
     ]
 
-    system_prompt = (
-        "당신은 RSS 뉴스 수집 계획 수립기입니다. 제공된 언론사 목록의 'source_name'과 'category'를 참고해 "
-        "사용자의 자연어 요청을 해석하고 유효한 JSON만 출력하세요.\n"
-        "출력 형식:\n"
-        "{\n"
-        '  "default_limit": 5,\n'
-        '  "configs": [\n'
-        '    {"source_name": "목록의 정확한 source_name", "category": "카테고리", "rss_urls": ["https://..."], "limit": 4}\n'
-        "  ]\n"
-        "}\n"
-        "규칙:\n"
-        "- 반드시 제공된 목록의 정확한 source_name만 사용하세요 (예: '연합/국제' -> '연합/세계', '조선일보 정치' -> '조선/정치', '조선일보 국제' -> '조선/국제', '동아일보 경제' -> '동아일보/경제', '동아 전체' -> '동아/전체').\n"
-        "- 특정 언론사나 분야가 지정되면 관련된 항목만 선택하세요. '모든 언론사/전체 언론사'처럼 명시할 때만 전체를 포함하세요.\n"
-        "- 요청 문맥상 개수가 없으면 가벼운 확인/요약은 3~5, 일반 수집은 5~10 범위로 합리적으로 정하세요.\n"
-        "- 언론사·분야별 개수가 다르면 각 config의 limit을 다르게 지정하세요."
-    )
+    parsed = _infer_llm_plan(request_text=request_text, available_summary=available_summary)
+    if not parsed:
+        # 추론 모델 호출 자체가 실패한 경우에만 안전하게 미실행 안내 반환
+        return {
+            "storage_mode": effective_mode,
+            "default_limit": 5,
+            "configs": [],
+            "unsupported_items": [request_text.strip()] if (request_text or "").strip() else [],
+            "message": "요청을 추론할 수 없어 수집을 실행하지 않았습니다.",
+        }
 
-    user_prompt = (
-        f"등록된 언론사-RSS 목록:\n{json.dumps(available_summary, ensure_ascii=False, indent=2)}\n\n"
-        f"사용자 요청: {request_text}"
-    )
-
-    parsed: Optional[Dict[str, Any]] = None
-    plan_max_tokens = int(os.getenv("PLAN_MAX_TOKENS", "600"))
-
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if groq_api_key:
-        from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_groq import ChatGroq
-
-        for model_name in _get_groq_model_queue():
-            try:
-                llm = ChatGroq(
-                    model=model_name,
-                    api_key=groq_api_key,
-                    temperature=0.1,
-                    max_tokens=plan_max_tokens,
-                )
-                resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-                raw = resp.content if isinstance(resp.content, str) else str(resp.content)
-                parsed = _extract_json_block(raw)
-                if parsed and isinstance(parsed.get("configs"), list):
-                    break
-            except Exception as e:
-                print(f"[!] plan_sources Groq({model_name}) 실패: {e}", file=sys.stderr)
-
-    if (not parsed or not isinstance(parsed.get("configs"), list)) and os.getenv("USE_OLLAMA", "false").lower() == "true":
-        try:
-            ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-            ollama_model = os.getenv("OLLAMA_MODEL", "gemma3:4b")
-            r = requests.post(
-                ollama_url,
-                json={"model": ollama_model, "prompt": f"{system_prompt}\n\n{user_prompt}", "stream": False},
-                timeout=30,
-            )
-            r.raise_for_status()
-            raw = r.json().get("response", "")
-            parsed = _extract_json_block(raw)
-        except Exception as e:
-            print(f"[!] plan_sources Ollama 실패: {e}", file=sys.stderr)
-
-    if not parsed or not isinstance(parsed.get("configs"), list):
-        return _fallback_parse_request(
-            request_text=request_text,
-            press_map=press_map,
-            effective_mode=effective_mode,
-            sqlite_path=sqlite_path,
-        )
+    default_limit = int(parsed.get("default_limit") or 5)
+    raw_unsupported = parsed.get("unsupported_items")
+    unsupported_items = [str(x).strip() for x in raw_unsupported if str(x).strip()] if isinstance(raw_unsupported, list) else []
 
     final_configs: List[Dict[str, Any]] = []
+    seen_sources = set()
+
     for item in parsed.get("configs") or []:
         if not isinstance(item, dict):
             continue
         src_name = str(item.get("source_name") or "").strip()
-        base_entry = press_map.get(src_name) or next(
-            (v for k, v in press_map.items() if k.lower() == src_name.lower()),
-            {},
-        )
+        if not src_name or src_name not in press_map or src_name in seen_sources:
+            continue
+
+        base_entry = press_map[src_name]
         urls = item.get("rss_urls") or base_entry.get("urls") or []
         if isinstance(urls, str):
             urls = [urls]
-        urls = [str(u).strip() for u in urls if str(u).strip()]
-        if not src_name or not urls:
+        urls = [str(u).strip() for u in urls if str(u).strip() and str(u).strip() in (base_entry.get("urls") or [])] or list(base_entry.get("urls") or [])
+        if not urls:
             continue
 
+        seen_sources.add(src_name)
+        item_limit = item.get("limit") if item.get("limit") is not None else default_limit
         cfg: Dict[str, Any] = {
             "source_name": src_name,
             "category": str(item.get("category") or base_entry.get("category") or "종합").strip(),
             "rss_urls": urls,
             "storage_mode": effective_mode,
+            "limit": int(item_limit),
         }
-        item_limit = item.get("limit") if item.get("limit") is not None else parsed.get("default_limit")
-        if item_limit is not None:
-            cfg["limit"] = int(item_limit)
         if sqlite_path:
             cfg["sqlite_path"] = sqlite_path
-
         final_configs.append(cfg)
 
-    if not final_configs:
-        return _fallback_parse_request(
-            request_text=request_text,
-            press_map=press_map,
-            effective_mode=effective_mode,
-            sqlite_path=sqlite_path,
-        )
+    status_message = _build_status_message(final_configs, unsupported_items)
 
     return {
         "storage_mode": effective_mode,
-        "default_limit": parsed.get("default_limit"),
+        "default_limit": default_limit,
         "configs": final_configs,
+        "unsupported_items": unsupported_items,
+        "message": status_message,
     }
 
 
@@ -370,8 +280,9 @@ def execute_rss_request(
     request_text: str,
     storage_mode: Optional[str] = None,
     sqlite_path: Optional[str] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """계획 수립 후 rss_base_crawler의 crawl_multiple_rss_sources로 실제 수집까지 한 번에 실행합니다."""
+    """LLM 추론 계획을 바탕으로 지원되는 소스만 수집하고, 미지원 항목 안내 및 불필요한 크롤링 차단을 수행합니다."""
     try:
         from crawler.rss_base_crawler import crawl_multiple_rss_sources
     except ImportError:
@@ -382,55 +293,48 @@ def execute_rss_request(
         storage_mode=storage_mode,
         sqlite_path=sqlite_path,
     )
+
+    if planned.get("help"):
+        return {
+            "help": True,
+            "guide": planned.get("guide", ""),
+            "planned": planned,
+            "processed_total": 0,
+            "skipped_crawl": True,
+            "message": "",
+        }
+
+    if planned.get("mode_updated"):
+        return {
+            "planned": planned,
+            "processed_total": 0,
+            "skipped_crawl": True,
+            "message": f"저장 모드를 `{planned.get('storage_mode')}`로 변경했습니다.",
+        }
+
     configs = planned.get("configs") or []
     effective_mode = planned.get("storage_mode")
+    message = planned.get("message") or ""
 
-    processed = (
-        crawl_multiple_rss_sources(
-            sources_config=configs,
-            limit=planned.get("default_limit"),
-            storage_mode=effective_mode,
-            sqlite_path=sqlite_path,
-        )
-        if configs
-        else 0
+    if not configs:
+        return {
+            "planned": planned,
+            "processed_total": 0,
+            "skipped_crawl": True,
+            "message": message or "요청하신 항목은 RSS가 제공하지 않아 수집을 실행하지 않습니다.",
+        }
+
+    processed = crawl_multiple_rss_sources(
+        sources_config=configs,
+        limit=planned.get("default_limit"),
+        storage_mode=effective_mode,
+        sqlite_path=sqlite_path,
+        on_progress=on_progress,
     )
 
     return {
         "planned": planned,
         "processed_total": processed,
+        "skipped_crawl": False,
+        "message": message,
     }
-
-def is_help_request(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    cleaned = text.strip().lower()
-    return cleaned in ("--help", "-h", "help", "도움말", "가이드") or "--help" in cleaned
-
-
-def get_rss_crawling_guide() -> str:
-    return """
-=== RSS 뉴스 크롤링 가이드 ===
-
-1. 자연어 수집 요청 예시
-   - "연합/국제 4개, 경향에서 종합 2개, 조선일보 정치 3개 모아줘"
-   - "동아일보 경제 4개, AI 뉴스 2개 가볍게 가져와줘"
-   - "모든 국제 뉴스 가볍게 5개 모아줘"
-
-2. 저장소 모드 전환 (서버 상태 파일 storage_mode_state.json에 저장)
-   - "앞으로 sqlite로 저장해줘"  -> 이후 요청 기본값을 sqlite로 유지
-   - "다시 db로 바꿔줘"          -> 이후 요청 기본값을 postgres(DB)로 복귀
-   - 호출 시 storage_mode="sqlite" 또는 "postgres"를 직접 넘겨 덮어쓸 수도 있습니다.
-
-3. 주요 등록 소스(source_name) 예시
-   - 연합: 연합/종합, 연합/경제, 연합/산업_IT, 연합/정치, 연합/사회, 연합/세계
-   - 경향: 경향/종합, 경향/경제, 경향/정치, 경향/사회, 경향/IT_과학
-   - 경제/IT: 한경/전체, 한경/경제, 한경/IT, 매경/경제, 매경/기업_경영, AITIMES, 전자신문/전체, 테크M
-   - 일간지/기타: 한겨레/전체, 조선일보/전체, 조선/정치, 조선/국제, 조선비즈/전체, 동아/전체, 동아일보/경제, SBS/뉴스, 뉴시스/속보, 조세일보/전체
-
-4. 팁
-   - 개수를 따로 적지 않으면 문맥("가볍게/몇 개/테스트" -> 3개, 일반 -> 5개, "넉넉히/많이" -> 15개)에 맞춰 자동 설정됩니다.
-   - "연합/국제", "조선일보 정치"처럼 자연어 별칭을 써도 등록된 source_name으로 자동 매칭됩니다.
-""".strip()
-
-
