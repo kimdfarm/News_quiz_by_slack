@@ -54,19 +54,7 @@ DEFAULT_PRESS_RSS_MAP: Dict[str, Dict[str, Any]] = {
         "category": "IT/과학",
     },
 
-    # --- 한국경제 / 매일경제 (경제·산업·IT 가치 높음) ---
-    "한경/전체": {
-        "urls": ["https://www.hankyung.com/feed/all-news"],
-        "category": "경제",
-    },
-    "한경/경제": {
-        "urls": ["https://www.hankyung.com/feed/economy"],
-        "category": "경제",
-    },
-    "한경/IT": {
-        "urls": ["https://www.hankyung.com/feed/it"],
-        "category": "IT/테크",
-    },
+    # --- 매일경제 (경제·산업·IT 가치 높음) ---
     "매경/경제": {
         "urls": ["https://www.mk.co.kr/rss/30100041/"],
         "category": "경제",
