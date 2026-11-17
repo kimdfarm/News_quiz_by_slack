@@ -66,15 +66,22 @@ MCP_TOOL_CATALOG = [
         "description": "저장소 백엔드를 postgres(네온db/DB) 또는 sqlite(로컬/파일)로 변경한다.",
     },
     {
+        "tool": "export_sqlite_file",
+        "description": "SQLite DB 파일(news_store.sqlite)을 Slack으로 추출/다운로드할 수 있게 업로드한다.",
+    },
+    {
         "tool": "get_recent_news_for_quiz",
         "description": "저장된 최근 뉴스를 조회해 시사 퀴즈를 만든다.",
+    },
+    {
+        "tool": "get_storage_status",
+        "description": "현재 저장소 설정과 SQLite / Postgres 연결·파일 상태를 조회한다.",
     },
     {
         "tool": "none",
         "description": "위 도구 목록에 없는 기능이나 무관한 요청이면 반드시 선택한다.",
     },
 ]
-
 
 def _clean_mention_text(text: str) -> str:
     return re.sub(r"<@[A-Z0-9_]+>", "", text or "").strip()
@@ -195,21 +202,25 @@ def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
         "당신은 Slack 봇의 MCP 도구 선택기입니다. 사용자 요청을 보고 아래 도구 중 하나만 고르세요.\n"
         f"{json.dumps(MCP_TOOL_CATALOG, ensure_ascii=False, indent=2)}\n\n"
         "설명/잡담/마크다운 없이 순수 JSON 객체 1개만 출력하세요:\n"
-        '{"tool": "run_rss_by_request | set_storage_backend | get_recent_news_for_quiz | none", '
+        '{"tool": "run_rss_by_request | set_storage_backend | export_sqlite_file | get_recent_news_for_quiz | get_storage_status | none", '
         '"storage_backend": "sqlite | postgres | null", "category": "전체", "limit": 5}\n'
         "규칙:\n"
-        "- 저장소/DB/데이터 저장 위치 변경 요청(예: '네온db로 변경해줘', 'sqlite로 바꿔줘', '로컬 파일로 저장해줘', '디비로 변경') -> set_storage_backend\n"
-        "  * sqlite/로컬/파일 -> storage_backend: \"sqlite\"\n"
-        "  * postgres/neon/네온db/db/디비 -> storage_backend: \"postgres\"\n"
+        "- 저장소/DB/데이터 저장 위치·모드 변경 요청(예: '네온db로 변경해줘', 'sqlite로 바꿔줘', '저장 상태를 파일 형태로 바꿔줘', '로컬 파일로 저장해줘', '디비로 변경') -> set_storage_backend\n"
+        "  * sqlite/로컬/파일 저장 모드 전환 -> storage_backend: \"sqlite\"\n"
+        "  * postgres/neon/네온db/db/디비 저장 모드 전환 -> storage_backend: \"postgres\"\n"
+        "- 저장된 sqlite 파일 자체를 다운로드/추출/내보내기/보내줘 요청(예: 'sqlite 파일 추출해줘', 'news_store.sqlite 다운로드', 'sqlite 파일 보내줘') -> export_sqlite_file\n"
         "- RSS 수집/크롤링/기사 모아줘/기사 수집해줘 요청 -> run_rss_by_request\n"
         "- 퀴즈/문제 출제 요청 -> get_recent_news_for_quiz\n"
+        "- 저장소 상태/DB 상태/SQLite 상태/연결 상태 조회 요청(예: '저장소 상태 확인해줘', 'DB 연결 상태 보고해줘', '현재 어디에 저장 중이지?') -> get_storage_status\n"
         "- 그 외 모든 요청 -> none"
     )
 
     valid_tools = {
         "run_rss_by_request",
         "set_storage_backend",
+        "export_sqlite_file",
         "get_recent_news_for_quiz",
+        "get_storage_status",
         "none",
     }
 
@@ -237,7 +248,7 @@ def ask_llm_for_quiz(prompt: str) -> str:
 
 
 @app.event("app_mention")
-def handle_mention(event, say):
+def handle_mention(event, say,client):
     if is_crawling():
         say(text="현재 다른 사용자가 뉴스를 수집하고 있어요. 잠시 후 다시 시도해 주세요.")
         return
@@ -340,6 +351,63 @@ def handle_mention(event, say):
             "위 뉴스를 바탕으로 4지선다형 시사 퀴즈 1문항, 정답, 해설을 만들어주세요."
         )
         say(text=ask_llm_for_quiz(prompt))
+        return
+
+    if tool == "export_sqlite_file":
+        raw_res = mcp_tools.export_sqlite_file(sqlite_path=DEFAULT_SQLITE_PATH)
+        info = json.loads(raw_res)
+        if info.get("status") != "ok":
+            say(text=f"❌ {info.get('message') or 'SQLite 파일을 찾지 못했어요.'}")
+            return
+
+        file_path = info["file_path"]
+        filename = info.get("filename") or "news_store.sqlite"
+        size_kb = round((info.get("size_bytes") or 0) / 1024, 1)
+        channel_id = event.get("channel")
+
+        try:
+            client.files_upload_v2(
+                channel=channel_id,
+                file=file_path,
+                filename=filename,
+                title=filename,
+                initial_comment=f"📦 `{filename}` ({size_kb} KB) 파일을 추출했어요. 클릭해서 다운로드하세요.",
+            )
+        except Exception as e:
+            say(text=f"❌ Slack 파일 업로드 실패: {e}")
+        return
+
+    if tool == "get_storage_status":
+        raw_res = mcp_tools.get_storage_status(sqlite_path=DEFAULT_SQLITE_PATH)
+        data = json.loads(raw_res)
+
+        active_mode = (data.get("active_backend") or "미확인").strip().lower()
+        if active_mode == "sqlite":
+            mode_label = f"`{active_mode}` (파일 저장중)"
+        elif active_mode == "postgres":
+            mode_label = f"`{active_mode}` (neon db로 저장중)"
+        else:
+            mode_label = f"`{active_mode}`"
+
+        sq = data.get("sqlite") or {}
+        pg = data.get("postgres") or {}
+
+        sq_status = "정상 준비됨" if sq.get("exists") else "미준비"
+        if pg.get("connected"):
+            pg_status = "정상 연결됨"
+        elif pg.get("configured"):
+            pg_status = "연결 실패"
+        else:
+            pg_status = "미설정"
+
+        say(
+            text=(
+                f"📌 *저장소 상태*\n"
+                f"• 현재 모드: {mode_label}\n"
+                f"• SQLite: {sq_status}\n"
+                f"• PostgreSQL: {pg_status}"
+            )
+        )
         return
 
     say(text="그런 기능은 없어요.")

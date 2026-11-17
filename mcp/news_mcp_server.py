@@ -134,5 +134,98 @@ def run_rss_by_request(
         traceback.print_exc(file=sys.stderr)
         raise RuntimeError(f"run_rss_by_request 실패 ({type(e).__name__}): {e}") from e
 
+@mcp.tool()
+def export_sqlite_file(sqlite_path: Optional[str] = None) -> str:
+    """SQLite DB 파일(news_store.sqlite)의 경로와 파일 정보를 확인해 다운로드용 메타데이터를 반환합니다."""
+    default_file = os.path.join(_ROOT_DIR, "SQLITE", "news_store.sqlite")
+    raw_path = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or default_file).strip()
+
+    # 상대경로나 파일명만 들어온 경우 SQLITE 폴더 기준으로 보정
+    if not os.path.isabs(raw_path) and not os.path.exists(raw_path):
+        candidate = os.path.join(_ROOT_DIR, "SQLITE", os.path.basename(raw_path))
+        if os.path.exists(candidate):
+            raw_path = candidate
+
+    abs_path = os.path.abspath(raw_path)
+    if not os.path.isfile(abs_path):
+        return json.dumps(
+            {
+                "status": "error",
+                "message": f"SQLite 파일을 찾을 수 없습니다: {abs_path}",
+                "file_path": abs_path,
+            },
+            ensure_ascii=False,
+        )
+
+    stat = os.stat(abs_path)
+    return json.dumps(
+        {
+            "status": "ok",
+            "file_path": abs_path,
+            "filename": os.path.basename(abs_path),
+            "size_bytes": stat.st_size,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def get_storage_status(sqlite_path: Optional[str] = None) -> str:
+    """현재 활성 저장소 모드와 SQLite / Postgres 연결 및 파일 상태를 반환합니다."""
+    from datetime import datetime
+    from storage_backend import (
+        DEFAULT_SQLITE_PATH as BACKEND_DEFAULT_SQLITE,
+        get_active_storage_backend,
+    )
+
+    active_mode = get_active_storage_backend()
+    target_sqlite = os.path.abspath((sqlite_path or os.getenv("NEWS_SQLITE_PATH") or BACKEND_DEFAULT_SQLITE).strip())
+
+    sqlite_info: Dict[str, Any] = {
+        "path": target_sqlite,
+        "exists": os.path.isfile(target_sqlite),
+        "size_bytes": 0,
+        "updated_at": None,
+    }
+    if sqlite_info["exists"]:
+        st = os.stat(target_sqlite)
+        sqlite_info["size_bytes"] = st.st_size
+        sqlite_info["updated_at"] = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    postgres_info: Dict[str, Any] = {
+        "configured": bool(db_url),
+        "connected": False,
+        "error": None,
+    }
+    if db_url:
+        try:
+            from database import get_db_connection
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+            cur.close()
+            conn.close()
+            postgres_info["connected"] = True
+        except Exception as e:
+            postgres_info["error"] = str(e)
+
+    return json.dumps(
+        {
+            "status": "ok",
+            "active_backend": active_mode,
+            "sqlite": sqlite_info,
+            "postgres": postgres_info,
+        },
+        ensure_ascii=False,
+    )
+
+
+
+
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
