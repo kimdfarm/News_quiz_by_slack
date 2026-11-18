@@ -22,7 +22,7 @@ from mcp.server.mcpserver import MCPServer
 from crawler.news.plan_sources_from_request import plan_sources_from_request
 from crawler.rss_base_crawler import crawl_multiple_rss_sources
 from database import get_db_connection
-from sqlite_store import get_sqlite_conn, init_sqlite_db
+from sqlite_store import checkpoint_sqlite, get_sqlite_conn, init_sqlite_db
 from storage_backend import (
     DEFAULT_SQLITE_PATH,
     fetch_recent_news,
@@ -157,6 +157,7 @@ def export_sqlite_file(sqlite_path: Optional[str] = None) -> str:
             ensure_ascii=False,
         )
 
+    checkpoint_sqlite(abs_path)
     stat = os.stat(abs_path)
     return json.dumps(
         {
@@ -167,7 +168,6 @@ def export_sqlite_file(sqlite_path: Optional[str] = None) -> str:
         },
         ensure_ascii=False,
     )
-
 
 @mcp.tool()
 def get_storage_status(sqlite_path: Optional[str] = None) -> str:

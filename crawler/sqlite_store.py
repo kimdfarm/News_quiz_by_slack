@@ -103,6 +103,8 @@ def init_sqlite_db(db_path: Optional[str] = None):
         CREATE INDEX IF NOT EXISTS idx_perspectives_published_at ON news_perspectives(published_at DESC);
     """)
     conn.commit()
+    cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -386,6 +388,8 @@ def save_news_article_sqlite(data: Dict[str, Any], db_path: Optional[str] = None
                     )
 
             conn.commit()
+            cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.commit()
             return
 
         # 2. 새로운 기사 내용인 경우 -> 이슈 마스터 및 기자 관점 최초 적재
@@ -451,6 +455,8 @@ def save_news_article_sqlite(data: Dict[str, Any], db_path: Optional[str] = None
         )
 
         conn.commit()
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -470,13 +476,20 @@ def clean_old_news_sqlite(days: int = 7, db_path: Optional[str] = None):
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     try:
         cur.execute(
-            "DELETE FROM news_issues WHERE published_at < ? OR created_at < ?;",
-            (cutoff, cutoff),
-        )
-        cur.execute(
             "DELETE FROM news_perspectives WHERE published_at < ? OR created_at < ?;",
             (cutoff, cutoff),
         )
+        deleted = cur.rowcount or 0
+        cur.execute(
+            """
+            DELETE FROM news_issues
+            WHERE id NOT IN (SELECT DISTINCT issue_id FROM news_perspectives WHERE issue_id IS NOT NULL);
+            """
+        )
+        conn.commit()
+        if deleted > 0:
+            conn.execute("VACUUM;")
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -484,7 +497,6 @@ def clean_old_news_sqlite(days: int = 7, db_path: Optional[str] = None):
     finally:
         cur.close()
         conn.close()
-
 
 def compact_old_raw_contents_sqlite(days: int = 2, db_path: Optional[str] = None):
     """database.py의 compact_old_raw_contents와 동일하게 오래된 원문을 비워 용량을 절약합니다."""
@@ -506,6 +518,7 @@ def compact_old_raw_contents_sqlite(days: int = 2, db_path: Optional[str] = None
             """,
             (cutoff,),
         )
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -580,6 +593,10 @@ def delete_perspectives_by_ids_sqlite(
             WHERE id NOT IN (SELECT DISTINCT issue_id FROM news_perspectives WHERE issue_id IS NOT NULL);
         """)
         conn.commit()
+        if deleted > 0:
+            conn.execute("VACUUM;")
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.commit()
         return deleted
     except Exception:
         conn.rollback()
@@ -604,6 +621,10 @@ def delete_old_records_sqlite(
             DELETE FROM news_issues
             WHERE id NOT IN (SELECT DISTINCT issue_id FROM news_perspectives WHERE issue_id IS NOT NULL);
         """)
+        conn.commit()
+        if deleted > 0:
+            conn.execute("VACUUM;")
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         conn.commit()
         return deleted
     except Exception:
@@ -644,6 +665,8 @@ def clear_all_sqlite_data(
             DELETE FROM sqlite_sequence WHERE name IN ('news_perspectives', 'news_issues', 'categories', 'sources');
         """)
         conn.commit()
+        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.commit()
         if vacuum:
             conn.execute("VACUUM;")
     except Exception:
@@ -651,4 +674,19 @@ def clear_all_sqlite_data(
         raise
     finally:
         cur.close()
+        conn.close()
+
+def checkpoint_sqlite(db_path: Optional[str] = None, mode: str = "TRUNCATE") -> None:
+    """WAL 변경 사항을 본체 .sqlite 파일에 즉시 반영하고 WAL 파일을 비웁니다."""
+    target_path = _resolve_db_path(db_path)
+    if not os.path.exists(target_path):
+        return
+    valid_modes = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+    ckpt_mode = mode.upper() if mode and mode.upper() in valid_modes else "TRUNCATE"
+    conn = sqlite3.connect(target_path, timeout=15.0)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute(f"PRAGMA wal_checkpoint({ckpt_mode});")
+        conn.commit()
+    finally:
         conn.close()

@@ -76,50 +76,58 @@ TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
             "tool": "set_storage_backend",
             "description": (
                 "저장소 백엔드 모드(sqlite 파일 vs postgres/neon db)를 변경한다. "
-                "예: '네온db로 변경해줘', 'sqlite로 바꿔줘', '저장 상태를 파일 형태로 바꿔줘'"
+                "예: '네온db로 변경해줘', 'sqlite로 바꿔줘', '저장 상태를 파일 형태로 바꿔줘', "
+                "'로컬 파일 모드로 전환', '디지털 DB로 저장하게 해줘'"
             ),
         },
         {
             "tool": "export_sqlite_file",
             "description": (
                 "로컬 SQLite DB 파일(news_store.sqlite) 자체를 Slack으로 추출/다운로드한다. "
-                "예: 'sqlite 파일 추출해줘', 'news_store.sqlite 다운로드', 'sqlite 파일 보내줘'"
+                "예: 'sqlite 파일 추출해줘', 'news_store.sqlite 다운로드', 'sqlite 파일 보내줘', "
+                "'파일 추출해줘', 'db 파일 내려받기', '로컬 파일 줘'"
             ),
         },
         {
             "tool": "get_storage_status",
             "description": (
                 "현재 활성 저장소 모드와 SQLite / Postgres 연결·파일 상태를 조회한다. "
-                "예: '저장소 상태 확인해줘', 'DB 연결 상태 보고해줘', '현재 어디에 저장 중이지?'"
+                "예: '저장소 상태 확인해줘', 'DB 연결 상태 보고해줘', '현재 어디에 저장 중이지?', "
+                "'현재 db 상태 어때?', '저장소 연결 확인'"
             ),
         },
         {
             "tool": "get_storage_stats",
             "description": (
                 "저장소(sqlite 또는 postgres)의 기사 수, 언론사별·분야별·기간 통계를 조회한다. "
-                "예: '저장된 정보 통계 보여줘', '몇 건 쌓였어?', '통계 알려줘'"
+                "예: '저장된 정보 통계 보여줘', '몇 건 쌓였어?', '통계 알려줘', "
+                "'현재 db 통계', '언론사별 기사 수 보여줘', 'sqlite 통계 확인'"
             ),
         },
         {
             "tool": "sync_sqlite_to_postgres",
             "description": (
                 "[단방향: SQLite 파일 -> Neon DB(PostgreSQL)] 로컬 파일 데이터를 디지털 DB(Neon/Postgres)로 올린다. "
-                "예: 'sqlite를 postgres로 동기화해줘', '로컬 데이터 네온으로 올려줘', '파일 데이터 디지털 DB로 동기화', '파일 데이터를 디지털 db로 이동해줘/가져오게 해줘'"
+                "예: 'sqlite를 postgres로 동기화해줘', '로컬 데이터 네온으로 올려줘', '파일 데이터 디지털 DB로 동기화', "
+                "'파일 데이터를 디지털 db로 이동해줘/가져오게 해줘', 'sqlite에서 네온으로 5개만 동기화'"
             ),
         },
         {
             "tool": "sync_postgres_to_sqlite",
             "description": (
                 "[단방향: Neon DB(PostgreSQL) -> SQLite 파일] 디지털 DB(Neon/Postgres) 데이터를 로컬 파일로 내려받는다. "
-                "예: 'postgres를 sqlite로 동기화해줘', '네온 db 데이터를 로컬 파일로 가져와줘', '디지털 DB 데이터를 파일로 동기화', '디지털 db 데이터를 파일로 이동해줘/가져오게 해줘'"
+                "예: 'postgres를 sqlite로 동기화해줘', '네온 db 데이터를 로컬 파일로 가져와줘', '디지털 DB 데이터를 파일로 동기화', "
+                "'디지털 db 데이터를 파일로 이동해줘/가져오게 해줘', '네온에서 sqlite로 최근 10건 동기화'"
             ),
         },
         {
             "tool": "delete_news_records",
             "description": (
-                "언론사, 분야, 키워드, 최근 일수(days), 최근 건수(limit) 또는 전체(delete_all) 조건으로 "
+                "언론사/섹션, 분야, 키워드, 최근 일수(days), 건수(limit), 정렬순서(oldest/newest) 또는 전체(delete_all) 조건으로 "
                 "저장된 뉴스 데이터를 삭제한다. "
-                "예: '동아/스포츠 기사 지워줘', '환율 들어간 기사 삭제해줘', '최근 3일 뉴스 지워줘', '최근 5개 삭제해줘', 'sqlite 데이터 다 지워줘'"
+                "예: '오래된 연합/정치 정보 3개 삭제해줘', '조선일보 정보 전부 삭제해줘', '동아/스포츠 기사 지워줘', "
+                "'최근 2개 삭제해줘', '오래된 데이터 5개 지워줘', '환율 들어간 기사 삭제해줘', "
+                "'최근 3일 뉴스 지워줘', 'sqlite 데이터 다 지워줘'"
             ),
         },
     ],
@@ -128,14 +136,16 @@ TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
             "tool": "run_rss_by_request",
             "description": (
                 "자연어 요청을 해석해 RSS 뉴스를 크롤링/수집한다. "
-                "예: '국제 뉴스 3개 모아줘', '연합/경제 수집'"
+                "예: '국제 뉴스 3개 모아줘', '연합/경제 수집', '언론사별 각 정보 4개씩 가져와', "
+                "'경제 뉴스 5개 저장해줘', '정치 기사 2개씩 긁어와'"
             ),
         },
         {
             "tool": "get_recent_news_for_quiz",
             "description": (
                 "저장된 최근 뉴스를 바탕으로 시사 퀴즈를 생성한다. "
-                "예: '경제 뉴스로 퀴즈 내줘', '최근 뉴스 문제 만들어줘'"
+                "예: '경제 뉴스로 퀴즈 내줘', '최근 뉴스 문제 만들어줘', 'IT 뉴스 퀴즈 1문제 내줘', "
+                "'방금 수집한 기사로 퀴즈 만들어줘'"
             ),
         },
     ],
@@ -291,9 +301,15 @@ def _route_tool_group(user_text: str) -> str:
     """1단계 라우터: 요청이 속하는 기능 그룹만 LLM으로 분류."""
     router_prompt = (
         "사용자 요청이 속하는 기능 그룹 하나만 문맥으로 판별하세요.\n"
-        "- storage: 저장소 모드 변경, 상태/통계 조회, sqlite 파일 추출, 저장소 간 데이터 동기화\n"
+        "- storage: 저장소 모드 변경, 상태/통계 조회, sqlite 파일 추출, 저장소 간 데이터 동기화, "
+        "저장된 뉴스/정보 삭제(언론사·섹션·분야·키워드·기간·건수·전체 삭제 모두 포함)\n"
         "- content: RSS 뉴스 수집/크롤링, 저장된 뉴스 기반 시사 퀴즈 생성\n"
-        "- none: 위 그룹에 해당하지 않는 요청\n\n"
+        "- none: 위 그룹에 해당하지 않는 일반 대화나 무관한 요청\n\n"
+        "예시:\n"
+        "- '오래된 연합/정치 정보 3개 삭제해줘' -> storage\n"
+        "- '조선일보 정보 전부 삭제해줘' -> storage\n"
+        "- '언론사별 각 정보 4개씩 가져와' -> content\n"
+        "- '최근 뉴스로 퀴즈 내줘' -> content\n\n"
         '설명 없이 순수 JSON 1개만 출력하세요: {"group": "storage | content | none"}'
     )
     raw = _invoke_llm_with_fallback(

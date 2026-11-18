@@ -1,16 +1,23 @@
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from psycopg2.extras import Json
 
 from database import clean_old_news, get_db_connection
 
-DEFAULT_SQLITE_PATH = os.getenv("NEWS_SQLITE_PATH", "news_store.sqlite")
-STATE_FILE_PATH = Path(__file__).resolve().parent.parent / "storage_mode_state.json"
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+DEFAULT_SQLITE_DIR = PROJECT_ROOT / "SQLITE"
+DEFAULT_SQLITE_PATH = os.getenv(
+    "NEWS_SQLITE_PATH",
+    str(DEFAULT_SQLITE_DIR / "news_store.sqlite"),
+)
+STATE_FILE_PATH = PROJECT_ROOT / "storage_mode_state.json"
 
 
 def normalize_storage_backend(backend: Optional[str]) -> str:
@@ -64,6 +71,15 @@ def set_active_storage_backend(backend: str) -> str:
     _write_state_file(normalized)
     os.environ["STORAGE_BACKEND"] = normalized
     return normalized
+
+
+def _resolve_sqlite_path(sqlite_path: Optional[str] = None) -> str:
+    raw = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or DEFAULT_SQLITE_PATH).strip()
+    if not raw:
+        raw = str(DEFAULT_SQLITE_DIR / "news_store.sqlite")
+    if not os.path.isabs(raw):
+        raw = str(PROJECT_ROOT / raw)
+    return os.path.abspath(raw)
 
 
 def _parse_keywords_list(raw: Any) -> List[str]:
@@ -132,9 +148,8 @@ def _query_postgres_news(category: str, limit: int, days: int = 7) -> List[Dict[
             (category, category, cutoff, limit),
         )
         rows = cur.fetchall()
-        results = []
-        for r in rows:
-            results.append({
+        return [
+            {
                 "title": r[0],
                 "facts": r[1] or "",
                 "opinion": r[2] or "",
@@ -142,8 +157,9 @@ def _query_postgres_news(category: str, limit: int, days: int = 7) -> List[Dict[
                 "keywords": _parse_keywords_list(r[4]),
                 "source": r[5] or "",
                 "published_at": r[6].isoformat() if isinstance(r[6], datetime) else (str(r[6]) if r[6] else ""),
-            })
-        return results
+            }
+            for r in rows
+        ]
     finally:
         cur.close()
         conn.close()
@@ -155,13 +171,14 @@ def _query_sqlite_news(
     days: int = 7,
     db_path: str = DEFAULT_SQLITE_PATH,
 ) -> List[Dict[str, Any]]:
-    if not os.path.exists(db_path):
+    resolved = _resolve_sqlite_path(db_path)
+    if not os.path.exists(resolved):
         return []
 
     from crawler.sqlite_store import get_sqlite_conn
 
     cutoff_iso = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_sqlite_conn(db_path=db_path, read_only=True)
+    conn = get_sqlite_conn(db_path=resolved, read_only=True)
     cur = conn.cursor()
     try:
         cur.execute(
@@ -181,9 +198,8 @@ def _query_sqlite_news(
             (category, category, cutoff_iso, limit),
         )
         rows = cur.fetchall()
-        results = []
-        for r in rows:
-            results.append({
+        return [
+            {
                 "title": r["title"],
                 "facts": r["summary_facts"] or "",
                 "opinion": r["author_opinion"] or "",
@@ -191,8 +207,9 @@ def _query_sqlite_news(
                 "keywords": _parse_keywords_list(r["keywords"]),
                 "source": r["source_name"] or "",
                 "published_at": r["published_at"] or "",
-            })
-        return results
+            }
+            for r in rows
+        ]
     finally:
         cur.close()
         conn.close()
@@ -210,46 +227,36 @@ def fetch_recent_news(
         if storage_backend
         else get_active_storage_backend()
     )
+    resolved_path = _resolve_sqlite_path(sqlite_path)
     if active_backend == "sqlite":
-        articles = _query_sqlite_news(category=category, limit=limit, days=days, db_path=sqlite_path)
+        articles = _query_sqlite_news(category=category, limit=limit, days=days, db_path=resolved_path)
     else:
         articles = _query_postgres_news(category=category, limit=limit, days=days)
 
     return {
         "storage_backend": active_backend,
-        "sqlite_path": sqlite_path if active_backend == "sqlite" else None,
+        "sqlite_path": resolved_path if active_backend == "sqlite" else None,
         "category": category,
         "count": len(articles),
         "articles": articles,
     }
 
 
-def _resolve_sqlite_path(sqlite_path: Optional[str] = None) -> str:
-    raw = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or DEFAULT_SQLITE_PATH).strip()
-    return os.path.abspath(raw)
-
-
 def _ensure_sqlite_tables(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     try:
-        cur.execute(
+        cur.executescript(
             """
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL
             );
-            """
-        )
-        cur.execute(
-            """
+
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL
             );
-            """
-        )
-        cur.execute(
-            """
+
             CREATE TABLE IF NOT EXISTS news_issues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_title TEXT NOT NULL,
@@ -261,10 +268,7 @@ def _ensure_sqlite_tables(conn: sqlite3.Connection) -> None:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
-            """
-        )
-        cur.execute(
-            """
+
             CREATE TABLE IF NOT EXISTS news_perspectives (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 issue_id INTEGER REFERENCES news_issues(id) ON DELETE CASCADE,
@@ -702,6 +706,8 @@ def sync_postgres_to_sqlite(
                 skipped += 1
 
         sq_conn.commit()
+        sq_cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        sq_conn.commit()
         return {
             "status": "ok",
             "direction": "postgres_to_sqlite",
@@ -726,21 +732,56 @@ def sync_postgres_to_sqlite(
         pg_conn.close()
 
 
+def _known_press_prefixes() -> Set[str]:
+    names: Set[str] = set()
+    try:
+        from crawler.news.rss_sources import load_press_rss_map
+
+        for key in load_press_rss_map().keys():
+            clean_key = str(key).strip()
+            if not clean_key:
+                continue
+            names.add(clean_key)
+            prefix = clean_key.split("/", 1)[0].strip()
+            if prefix:
+                names.add(prefix)
+    except Exception:
+        pass
+    return names
+
+
+def _expand_source_candidates(raw_source: str, known_names: Set[str]) -> List[str]:
+    s = re.sub(r"\s+", " ", (raw_source or "").strip())
+    if not s:
+        return []
+
+    candidates: Set[str] = {s}
+    stripped_suffix = re.sub(r"(일보|신문|방송|뉴스|통신)$", "", s).strip()
+    if stripped_suffix:
+        candidates.add(stripped_suffix)
+
+    matched: Set[str] = set()
+    for cand in list(candidates):
+        if cand in known_names:
+            matched.add(cand)
+        for known in known_names:
+            if known == cand or known.startswith(f"{cand}/"):
+                matched.add(known)
+
+    return sorted(matched if matched else candidates)
+
+
 def delete_news_by_filter(
     source: Optional[str] = None,
     category: Optional[str] = None,
     keyword: Optional[str] = None,
     days: Optional[int] = None,
     limit: Optional[int] = None,
-    order: str = "newest",  # "newest" (최근순) | "oldest" (오래된순)
+    order: str = "newest",
     delete_all: bool = False,
     target_backend: Optional[str] = None,
     sqlite_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    DB 구조를 몰라도 언론사(source), 분야(category), 키워드(keyword),
-    최근 N일(days), 최근 N건(limit), 전체 삭제(delete_all) 조건으로 기사를 삭제합니다.
-    """
     active_backend = get_active_storage_backend()
     chosen_backend = (
         normalize_storage_backend(target_backend)
@@ -761,22 +802,27 @@ def delete_news_by_filter(
         clean_days is not None,
         clean_limit is not None,
     ])
+    effective_delete_all = bool(delete_all) and not has_any_filter
 
-    if not delete_all and not has_any_filter:
+    if not effective_delete_all and not has_any_filter:
         return {
             "status": "rejected",
             "backend": chosen_backend,
             "deleted_count": 0,
-            "message": "삭제 조건(언론사, 분야, 키워드, 기간, 건수)이 없어요. 전체 삭제를 원하면 delete_all=True로 지정해 주세요.",
+            "message": "삭제 조건(언론사, 분야, 키워드, 기간, 건수)이 없어요. 조건을 지정해 주세요.",
         }
+
+    known_names = _known_press_prefixes()
+    source_candidates = _expand_source_candidates(clean_source, known_names) if clean_source else []
 
     applied_filters = {
         "source": clean_source,
+        "matched_sources": source_candidates if clean_source else [],
         "category": clean_category,
         "keyword": clean_keyword,
         "days": clean_days,
         "limit": clean_limit,
-        "delete_all": bool(delete_all and not has_any_filter),
+        "delete_all": effective_delete_all,
     }
 
     if chosen_backend == "sqlite":
@@ -790,7 +836,9 @@ def delete_news_by_filter(
                 "message": f"SQLite 파일이 없어요: {db_file}",
             }
 
-        conn = sqlite3.connect(db_file)
+        conn = sqlite3.connect(db_file, timeout=15.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute("PRAGMA foreign_keys=ON;")
         cur = conn.cursor()
         try:
@@ -798,11 +846,35 @@ def delete_news_by_filter(
             params: List[Any] = []
 
             if clean_source:
-                where_clauses.append("s.name LIKE ?")
-                params.append(f"%{clean_source}%")
+                placeholders = ",".join(["?"] * len(source_candidates))
+                like_clauses = " OR ".join(["name LIKE ?"] * len(source_candidates))
+                like_params = [f"{c}/%" for c in source_candidates]
+                cur.execute(
+                    f"""
+                    SELECT id, name
+                    FROM sources
+                    WHERE name IN ({placeholders}) OR {like_clauses};
+                    """,
+                    source_candidates + like_params,
+                )
+                matched_source_ids = [int(r[0]) for r in cur.fetchall()]
+                if not matched_source_ids:
+                    return {
+                        "status": "ok",
+                        "backend": "sqlite",
+                        "deleted_count": 0,
+                        "filters": applied_filters,
+                        "sqlite_path": db_file,
+                        "message": f"'{clean_source}'에 해당하는 저장된 언론사가 없어 삭제하지 않았어요.",
+                    }
+                src_ph = ",".join(["?"] * len(matched_source_ids))
+                where_clauses.append(f"p.source_id IN ({src_ph})")
+                params.extend(matched_source_ids)
+
             if clean_category:
-                where_clauses.append("c.name LIKE ?")
-                params.append(f"%{clean_category}%")
+                where_clauses.append("c.name = ?")
+                params.append(clean_category)
+
             if clean_keyword:
                 kw_pat = f"%{clean_keyword}%"
                 where_clauses.append(
@@ -810,6 +882,7 @@ def delete_news_by_filter(
                     "OR COALESCE(p.author_opinion, '') LIKE ? OR COALESCE(i.keywords, '') LIKE ?)"
                 )
                 params.extend([kw_pat, kw_pat, kw_pat, kw_pat])
+
             if clean_days is not None:
                 cutoff_str = (datetime.now() - timedelta(days=clean_days)).strftime("%Y-%m-%d %H:%M:%S")
                 where_clauses.append("COALESCE(p.published_at, p.created_at) >= ?")
@@ -817,6 +890,7 @@ def delete_news_by_filter(
 
             where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
             order_dir = "ASC" if str(order).strip().lower() == "oldest" else "DESC"
+
             if clean_limit is not None:
                 select_sql = f"""
                     SELECT p.id
@@ -860,6 +934,12 @@ def delete_news_by_filter(
                 """
             )
             conn.commit()
+
+            if int(deleted_count) > 0:
+                conn.execute("VACUUM;")
+            cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            conn.commit()
+
             return {
                 "status": "ok",
                 "backend": "sqlite",
@@ -894,15 +974,37 @@ def delete_news_by_filter(
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        where_clauses = []
-        params = []
+        where_clauses: List[str] = []
+        params: List[Any] = []
 
         if clean_source:
-            where_clauses.append("s.name ILIKE %s")
-            params.append(f"%{clean_source}%")
+            placeholders = ",".join(["%s"] * len(source_candidates))
+            like_clauses = " OR ".join(["name LIKE %s"] * len(source_candidates))
+            like_params = [f"{c}/%" for c in source_candidates]
+            cur.execute(
+                f"""
+                SELECT id, name
+                FROM sources
+                WHERE name IN ({placeholders}) OR {like_clauses};
+                """,
+                source_candidates + like_params,
+            )
+            matched_source_ids = [int(r[0]) for r in cur.fetchall()]
+            if not matched_source_ids:
+                return {
+                    "status": "ok",
+                    "backend": "postgres",
+                    "deleted_count": 0,
+                    "filters": applied_filters,
+                    "message": f"'{clean_source}'에 해당하는 저장된 언론사가 없어 삭제하지 않았어요.",
+                }
+            where_clauses.append("p.source_id = ANY(%s)")
+            params.append(matched_source_ids)
+
         if clean_category:
-            where_clauses.append("c.name ILIKE %s")
-            params.append(f"%{clean_category}%")
+            where_clauses.append("c.name = %s")
+            params.append(clean_category)
+
         if clean_keyword:
             kw_pat = f"%{clean_keyword}%"
             where_clauses.append(
@@ -911,6 +1013,7 @@ def delete_news_by_filter(
                 "OR COALESCE(array_to_string(i.keywords, ' '), '') ILIKE %s)"
             )
             params.extend([kw_pat, kw_pat, kw_pat, kw_pat])
+
         if clean_days is not None:
             cutoff_dt = datetime.now() - timedelta(days=clean_days)
             where_clauses.append("COALESCE(p.published_at, p.created_at) >= %s")
@@ -918,6 +1021,7 @@ def delete_news_by_filter(
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         order_dir = "ASC" if str(order).strip().lower() == "oldest" else "DESC"
+
         if clean_limit is not None:
             select_sql = f"""
                 SELECT p.id
@@ -937,12 +1041,6 @@ def delete_news_by_filter(
             else:
                 deleted_count = 0
         else:
-            delete_sql = f"""
-                DELETE FROM news_perspectives p
-                USING news_issues i, categories c, sources s
-                WHERE True
-            """
-            # LEFT JOIN과 동일한 조건을 유지하기 위해 서브쿼리 사용
             delete_sql = f"""
                 DELETE FROM news_perspectives
                 WHERE id IN (
@@ -984,9 +1082,3 @@ def delete_news_by_filter(
     finally:
         cur.close()
         conn.close()
-
-
-
-
-
-
