@@ -160,7 +160,7 @@ def _query_sqlite_news(
 
     from crawler.sqlite_store import get_sqlite_conn
 
-    cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat()
+    cutoff_iso = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_sqlite_conn(db_path=db_path, read_only=True)
     cur = conn.cursor()
     try:
@@ -188,7 +188,7 @@ def _query_sqlite_news(
                 "facts": r["summary_facts"] or "",
                 "opinion": r["author_opinion"] or "",
                 "stance_type": r["stance_type"] or "중립",
-                "keywords": _parse_keywords_list(r["keywords_json"]),
+                "keywords": _parse_keywords_list(r["keywords"]),
                 "source": r["source_name"] or "",
                 "published_at": r["published_at"] or "",
             })
@@ -255,7 +255,7 @@ def _ensure_sqlite_tables(conn: sqlite3.Connection) -> None:
                 issue_title TEXT NOT NULL,
                 representative_summary TEXT,
                 category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-                keywords_json TEXT,
+                keywords TEXT,
                 issue_hash TEXT UNIQUE,
                 published_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -325,7 +325,7 @@ def _get_or_create_sqlite_issue(
     cur.execute(
         """
         INSERT INTO news_issues (
-            issue_title, representative_summary, category_id, keywords_json,
+            issue_title, representative_summary, category_id, keywords,
             issue_hash, published_at, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """,
@@ -487,7 +487,7 @@ def sync_sqlite_to_postgres(
                 {
                     "issue_title": r.get("issue_title"),
                     "representative_summary": r.get("representative_summary"),
-                    "keywords": _parse_keywords_list(r.get("keywords_json")),
+                    "keywords": _parse_keywords_list(r.get("keywords")),
                     "issue_hash": r.get("issue_hash"),
                     "published_at": r.get("issue_published_at"),
                     "created_at": r.get("issue_created_at"),
@@ -653,7 +653,7 @@ def sync_postgres_to_sqlite(
                     "issue_hash": r.get("issue_hash"),
                     "published_at": r.get("issue_published_at").isoformat() if isinstance(r.get("issue_published_at"), datetime) else r.get("issue_published_at"),
                     "created_at": r.get("issue_created_at").isoformat() if isinstance(r.get("issue_created_at"), datetime) else r.get("issue_created_at"),
-                    "updated_at": r.get("issue_updated_at").isoformat() if isinstance(r.get("issue_updated_at"), datetime) else r.get("issue_updated_at"),
+                    "updated_at": r.get("issue_updated_at").isoformat() if isinstance(r.get("issue_updated_at"), datetime) else r.get("issue_created_at"),
                 }
                 if r.get("issue_title") or r.get("issue_hash")
                 else None
@@ -724,3 +724,269 @@ def sync_postgres_to_sqlite(
         sq_conn.close()
         pg_cur.close()
         pg_conn.close()
+
+
+def delete_news_by_filter(
+    source: Optional[str] = None,
+    category: Optional[str] = None,
+    keyword: Optional[str] = None,
+    days: Optional[int] = None,
+    limit: Optional[int] = None,
+    order: str = "newest",  # "newest" (최근순) | "oldest" (오래된순)
+    delete_all: bool = False,
+    target_backend: Optional[str] = None,
+    sqlite_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    DB 구조를 몰라도 언론사(source), 분야(category), 키워드(keyword),
+    최근 N일(days), 최근 N건(limit), 전체 삭제(delete_all) 조건으로 기사를 삭제합니다.
+    """
+    active_backend = get_active_storage_backend()
+    chosen_backend = (
+        normalize_storage_backend(target_backend)
+        if target_backend and str(target_backend).strip()
+        else active_backend
+    )
+
+    clean_source = (source or "").strip() or None
+    clean_category = (category or "").strip() or None
+    clean_keyword = (keyword or "").strip() or None
+    clean_days = int(days) if days is not None and int(days) > 0 else None
+    clean_limit = int(limit) if limit is not None and int(limit) > 0 else None
+
+    has_any_filter = any([
+        bool(clean_source),
+        bool(clean_category),
+        bool(clean_keyword),
+        clean_days is not None,
+        clean_limit is not None,
+    ])
+
+    if not delete_all and not has_any_filter:
+        return {
+            "status": "rejected",
+            "backend": chosen_backend,
+            "deleted_count": 0,
+            "message": "삭제 조건(언론사, 분야, 키워드, 기간, 건수)이 없어요. 전체 삭제를 원하면 delete_all=True로 지정해 주세요.",
+        }
+
+    applied_filters = {
+        "source": clean_source,
+        "category": clean_category,
+        "keyword": clean_keyword,
+        "days": clean_days,
+        "limit": clean_limit,
+        "delete_all": bool(delete_all and not has_any_filter),
+    }
+
+    if chosen_backend == "sqlite":
+        db_file = _resolve_sqlite_path(sqlite_path)
+        if not os.path.isfile(db_file):
+            return {
+                "status": "unavailable",
+                "backend": "sqlite",
+                "deleted_count": 0,
+                "filters": applied_filters,
+                "message": f"SQLite 파일이 없어요: {db_file}",
+            }
+
+        conn = sqlite3.connect(db_file)
+        conn.execute("PRAGMA foreign_keys=ON;")
+        cur = conn.cursor()
+        try:
+            where_clauses: List[str] = []
+            params: List[Any] = []
+
+            if clean_source:
+                where_clauses.append("s.name LIKE ?")
+                params.append(f"%{clean_source}%")
+            if clean_category:
+                where_clauses.append("c.name LIKE ?")
+                params.append(f"%{clean_category}%")
+            if clean_keyword:
+                kw_pat = f"%{clean_keyword}%"
+                where_clauses.append(
+                    "(p.title LIKE ? OR COALESCE(p.summary_facts, '') LIKE ? "
+                    "OR COALESCE(p.author_opinion, '') LIKE ? OR COALESCE(i.keywords, '') LIKE ?)"
+                )
+                params.extend([kw_pat, kw_pat, kw_pat, kw_pat])
+            if clean_days is not None:
+                cutoff_str = (datetime.now() - timedelta(days=clean_days)).strftime("%Y-%m-%d %H:%M:%S")
+                where_clauses.append("COALESCE(p.published_at, p.created_at) >= ?")
+                params.append(cutoff_str)
+
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            order_dir = "ASC" if str(order).strip().lower() == "oldest" else "DESC"
+            if clean_limit is not None:
+                select_sql = f"""
+                    SELECT p.id
+                    FROM news_perspectives p
+                    LEFT JOIN sources s ON s.id = p.source_id
+                    LEFT JOIN news_issues i ON i.id = p.issue_id
+                    LEFT JOIN categories c ON c.id = i.category_id
+                    {where_sql}
+                    ORDER BY COALESCE(p.published_at, p.created_at) {order_dir}, p.id {order_dir}
+                    LIMIT ?;
+                """
+                cur.execute(select_sql, params + [clean_limit])
+                target_ids = [int(r[0]) for r in cur.fetchall()]
+                if target_ids:
+                    placeholders = ",".join(["?"] * len(target_ids))
+                    cur.execute(f"DELETE FROM news_perspectives WHERE id IN ({placeholders});", target_ids)
+                    deleted_count = cur.rowcount or 0
+                else:
+                    deleted_count = 0
+            else:
+                delete_sql = f"""
+                    DELETE FROM news_perspectives
+                    WHERE id IN (
+                        SELECT p.id
+                        FROM news_perspectives p
+                        LEFT JOIN sources s ON s.id = p.source_id
+                        LEFT JOIN news_issues i ON i.id = p.issue_id
+                        LEFT JOIN categories c ON c.id = i.category_id
+                        {where_sql}
+                    );
+                """
+                cur.execute(delete_sql, params)
+                deleted_count = cur.rowcount or 0
+
+            cur.execute(
+                """
+                DELETE FROM news_issues
+                WHERE id NOT IN (
+                    SELECT DISTINCT issue_id FROM news_perspectives WHERE issue_id IS NOT NULL
+                );
+                """
+            )
+            conn.commit()
+            return {
+                "status": "ok",
+                "backend": "sqlite",
+                "deleted_count": int(deleted_count),
+                "filters": applied_filters,
+                "sqlite_path": db_file,
+            }
+        except Exception as e:
+            conn.rollback()
+            return {
+                "status": "error",
+                "backend": "sqlite",
+                "deleted_count": 0,
+                "filters": applied_filters,
+                "message": f"SQLite 삭제 실패: {e}",
+            }
+        finally:
+            cur.close()
+            conn.close()
+
+    # postgres
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    if not db_url:
+        return {
+            "status": "unavailable",
+            "backend": "postgres",
+            "deleted_count": 0,
+            "filters": applied_filters,
+            "message": "DATABASE_URL 환경변수가 설정되지 않았어요.",
+        }
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        where_clauses = []
+        params = []
+
+        if clean_source:
+            where_clauses.append("s.name ILIKE %s")
+            params.append(f"%{clean_source}%")
+        if clean_category:
+            where_clauses.append("c.name ILIKE %s")
+            params.append(f"%{clean_category}%")
+        if clean_keyword:
+            kw_pat = f"%{clean_keyword}%"
+            where_clauses.append(
+                "(p.title ILIKE %s OR COALESCE(p.summary_facts, '') ILIKE %s "
+                "OR COALESCE(p.author_opinion, '') ILIKE %s "
+                "OR COALESCE(array_to_string(i.keywords, ' '), '') ILIKE %s)"
+            )
+            params.extend([kw_pat, kw_pat, kw_pat, kw_pat])
+        if clean_days is not None:
+            cutoff_dt = datetime.now() - timedelta(days=clean_days)
+            where_clauses.append("COALESCE(p.published_at, p.created_at) >= %s")
+            params.append(cutoff_dt)
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        order_dir = "ASC" if str(order).strip().lower() == "oldest" else "DESC"
+        if clean_limit is not None:
+            select_sql = f"""
+                SELECT p.id
+                FROM news_perspectives p
+                LEFT JOIN sources s ON s.id = p.source_id
+                LEFT JOIN news_issues i ON i.id = p.issue_id
+                LEFT JOIN categories c ON c.id = i.category_id
+                {where_sql}
+                ORDER BY COALESCE(p.published_at, p.created_at) {order_dir}, p.id {order_dir}
+                LIMIT %s;
+            """
+            cur.execute(select_sql, params + [clean_limit])
+            target_ids = [int(r[0]) for r in cur.fetchall()]
+            if target_ids:
+                cur.execute("DELETE FROM news_perspectives WHERE id = ANY(%s);", (target_ids,))
+                deleted_count = cur.rowcount or 0
+            else:
+                deleted_count = 0
+        else:
+            delete_sql = f"""
+                DELETE FROM news_perspectives p
+                USING news_issues i, categories c, sources s
+                WHERE True
+            """
+            # LEFT JOIN과 동일한 조건을 유지하기 위해 서브쿼리 사용
+            delete_sql = f"""
+                DELETE FROM news_perspectives
+                WHERE id IN (
+                    SELECT p.id
+                    FROM news_perspectives p
+                    LEFT JOIN sources s ON s.id = p.source_id
+                    LEFT JOIN news_issues i ON i.id = p.issue_id
+                    LEFT JOIN categories c ON c.id = i.category_id
+                    {where_sql}
+                );
+            """
+            cur.execute(delete_sql, params)
+            deleted_count = cur.rowcount or 0
+
+        cur.execute(
+            """
+            DELETE FROM news_issues
+            WHERE id NOT IN (
+                SELECT DISTINCT issue_id FROM news_perspectives WHERE issue_id IS NOT NULL
+            );
+            """
+        )
+        conn.commit()
+        return {
+            "status": "ok",
+            "backend": "postgres",
+            "deleted_count": int(deleted_count),
+            "filters": applied_filters,
+        }
+    except Exception as e:
+        conn.rollback()
+        return {
+            "status": "error",
+            "backend": "postgres",
+            "deleted_count": 0,
+            "filters": applied_filters,
+            "message": f"Neon DB 삭제 실패: {e}",
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+
+
+

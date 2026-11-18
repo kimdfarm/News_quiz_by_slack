@@ -31,6 +31,7 @@ from storage_backend import (
     set_active_storage_backend,
     sync_postgres_to_sqlite as _sync_pg_to_sq,
     sync_sqlite_to_postgres as _sync_sq_to_pg,
+    delete_news_by_filter,
 )
 
 mcp = MCPServer("news-quiz-mcp")
@@ -402,6 +403,33 @@ def sync_postgres_to_sqlite(
     """
     result = _sync_pg_to_sq(limit=limit, sqlite_path=_resolve_sqlite_target(sqlite_path))
     return json.dumps(result, ensure_ascii=False)
+
+@mcp.tool()
+def delete_news_records(
+    source: Optional[str] = None,
+    category: Optional[str] = None,
+    keyword: Optional[str] = None,
+    days: Optional[int] = None,
+    limit: Optional[int] = None,
+    order: str = "newest",
+    delete_all: bool = False,
+    target_backend: Optional[str] = None,
+    sqlite_path: Optional[str] = None,
+) -> str:
+    """언론사, 분야, 키워드, 기간(days), 건수(limit, newest/oldest) 또는 전체 조건으로 저장된 뉴스를 삭제합니다."""
+    result = delete_news_by_filter(
+        source=source,
+        category=category,
+        keyword=keyword,
+        days=days,
+        limit=limit,
+        order=order,
+        delete_all=delete_all,
+        target_backend=target_backend,
+        sqlite_path=_resolve_sqlite_target(sqlite_path),
+    )
+    return json.dumps(result, ensure_ascii=False)
+
 
 
 if __name__ == "__main__":

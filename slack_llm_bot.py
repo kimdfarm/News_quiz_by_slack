@@ -104,14 +104,22 @@ TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
             "tool": "sync_sqlite_to_postgres",
             "description": (
                 "[단방향: SQLite 파일 -> Neon DB(PostgreSQL)] 로컬 파일 데이터를 디지털 DB(Neon/Postgres)로 올린다. "
-                "예: 'sqlite를 postgres로 동기화해줘', '로컬 데이터 네온으로 올려줘', '파일 데이터 디지털 DB로 동기화'"
+                "예: 'sqlite를 postgres로 동기화해줘', '로컬 데이터 네온으로 올려줘', '파일 데이터 디지털 DB로 동기화', '파일 데이터를 디지털 db로 이동해줘/가져오게 해줘'"
             ),
         },
         {
             "tool": "sync_postgres_to_sqlite",
             "description": (
                 "[단방향: Neon DB(PostgreSQL) -> SQLite 파일] 디지털 DB(Neon/Postgres) 데이터를 로컬 파일로 내려받는다. "
-                "예: 'postgres를 sqlite로 동기화해줘', '네온 db 데이터를 로컬 파일로 가져와줘', '디지털 DB 데이터를 파일로 동기화'"
+                "예: 'postgres를 sqlite로 동기화해줘', '네온 db 데이터를 로컬 파일로 가져와줘', '디지털 DB 데이터를 파일로 동기화', '디지털 db 데이터를 파일로 이동해줘/가져오게 해줘'"
+            ),
+        },
+        {
+            "tool": "delete_news_records",
+            "description": (
+                "언론사, 분야, 키워드, 최근 일수(days), 최근 건수(limit) 또는 전체(delete_all) 조건으로 "
+                "저장된 뉴스 데이터를 삭제한다. "
+                "예: '동아/스포츠 기사 지워줘', '환율 들어간 기사 삭제해줘', '최근 3일 뉴스 지워줘', '최근 5개 삭제해줘', 'sqlite 데이터 다 지워줘'"
             ),
         },
     ],
@@ -310,7 +318,8 @@ def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
     if group == "storage":
         system_prompt = (
             "당신은 저장소 및 동기화 MCP 도구 선택기입니다. 사용자 발화의 의도, 출발지/목적지 방향, "
-            "대상 저장소, 건수 제한(limit)을 문맥으로 파악해 순수 JSON 1개만 출력하세요.\n"
+            "대상 저장소, 삭제 조건(언론사/분야/키워드/일수/건수/정렬순서/전체삭제)을 문맥으로 파악해 "
+            "순수 JSON 1개만 출력하세요.\n"
             f"{json.dumps(candidates, ensure_ascii=False, indent=2)}\n\n"
             "판별 기준:\n"
             "- 출발지가 로컬/파일/SQLite이고 목적지가 Neon/Postgres/디지털 DB/DB인 동기화 -> sync_sqlite_to_postgres\n"
@@ -319,10 +328,16 @@ def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
             "- SQLite 파일 자체를 내보내기/다운로드 -> export_sqlite_file\n"
             "- 현재 저장소 설정/연결/파일 상태 확인 -> get_storage_status\n"
             "- 기사 건수/언론사/분야/기간 통계 조회 -> get_storage_stats (특정 저장소가 언급되면 target_backend에 'sqlite' 또는 'postgres', 없으면 null)\n"
+            "- 특정 조건/전체 뉴스 삭제 -> delete_news_records "
+            "(target_backend: 'sqlite'|'postgres'|null, source, category, keyword, days, limit, "
+            "order: 'oldest' 또는 'newest', delete_all: boolean)\n"
             "- 해당 없음 -> none\n\n"
-            "limit 규칙:\n"
-            "- 특정 건수/개수 제한이 언급되면 양의 정수로 넣고, 전체/모두/다 또는 건수 제한 언급이 없으면 null을 넣으세요.\n\n"
-            '출력 형식: {"tool": "...", "storage_backend": null, "target_backend": null, "limit": null}'
+            "order 및 limit 규칙:\n"
+            "- '오래된/가장 먼저/옛날' N개 -> order: 'oldest', limit: N\n"
+            "- '최근/방금/최신' N개 또는 방향 언급 없음 -> order: 'newest', limit: N (제한 언급 없으면 null)\n\n"
+            '출력 형식: {"tool": "...", "storage_backend": null, "target_backend": null, '
+            '"source": null, "category": null, "keyword": null, "days": null, '
+            '"limit": null, "order": "newest", "delete_all": false}'
         )
     else:
         system_prompt = (
@@ -613,6 +628,69 @@ def handle_mention(event, say, client):
         )
         data = json.loads(raw_res)
         say(text=_format_sync_result(data, "Neon DB → SQLite"))
+        return
+
+    if tool == "delete_news_records":
+        target_backend = _normalize_backend_value(chosen.get("target_backend"))
+        source_val = (chosen.get("source") or "").strip() or None
+        category_val = (chosen.get("category") or "").strip() or None
+        keyword_val = (chosen.get("keyword") or "").strip() or None
+        days_val = _normalize_positive_int(chosen.get("days"), default=None)
+        limit_val = _normalize_positive_int(chosen.get("limit"), default=None)
+
+        raw_order = str(chosen.get("order") or "").strip().lower()
+        if raw_order in ("oldest", "asc", "오래된", "과거") or any(
+            k in user_text for k in ("오래된", "옛날", "가장 먼저", "먼저 들어온")
+        ):
+            order_val = "oldest"
+        else:
+            order_val = "newest"
+
+        delete_all_val = bool(chosen.get("delete_all") is True)
+
+        raw_res = mcp_tools.delete_news_records(
+            source=source_val,
+            category=category_val,
+            keyword=keyword_val,
+            days=days_val,
+            limit=limit_val,
+            order=order_val,
+            delete_all=delete_all_val,
+            target_backend=target_backend,
+            sqlite_path=DEFAULT_SQLITE_PATH,
+        )
+        data = json.loads(raw_res)
+        status = data.get("status")
+        if status != "ok":
+            say(text=f"⚠️ 삭제 처리 안내: {data.get('message') or '삭제할 수 없었어요.'}")
+            return
+
+        applied = data.get("filters") or {}
+        cond_parts = []
+        if applied.get("delete_all"):
+            cond_parts.append("전체 데이터")
+        if source_val:
+            cond_parts.append(f"언론사={source_val}")
+        if category_val:
+            cond_parts.append(f"분야={category_val}")
+        if keyword_val:
+            cond_parts.append(f"키워드={keyword_val}")
+        if days_val:
+            cond_parts.append(f"최근 {days_val}일")
+        if limit_val:
+            order_label = "오래된" if order_val == "oldest" else "최근"
+            cond_parts.append(f"{order_label} {limit_val}건")
+
+        cond_summary = ", ".join(cond_parts) if cond_parts else "지정 조건"
+        backend_name = data.get("backend") or "알 수 없음"
+        deleted_cnt = int(data.get("deleted_count") or 0)
+        say(
+            text=(
+                f"🗑️ *뉴스 삭제 완료* (`{backend_name}`)\n"
+                f"• 적용 조건: {cond_summary}\n"
+                f"• 삭제된 기사 수: *{deleted_cnt}건*"
+            )
+        )
         return
 
     say(text="그런 기능은 없어요.")
