@@ -473,20 +473,59 @@ def sync_sqlite_to_postgres(
 
         inserted = 0
         skipped = 0
+        seen_urls_in_batch: Set[str] = set()
+        seen_hashes_in_batch: Set[str] = set()
 
         for r in rows:
-            url = (r.get("url") or "").strip()
-            if not url:
+            raw_url = (r.get("url") or "").strip()
+            norm_url = raw_url.lower()
+            content_hash = (r.get("content_hash") or "").strip()
+            title = (r.get("title") or "").strip()
+
+            # 1) URL 기준 중복 체크 (현재 배치 + 기존 DB)
+            if norm_url:
+                if norm_url in seen_urls_in_batch:
+                    skipped += 1
+                    continue
+                dst_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE LOWER(TRIM(url)) = ? LIMIT 1;",
+                    (norm_url,),
+                )
+                if dst_cur.fetchone():
+                    seen_urls_in_batch.add(norm_url)
+                    skipped += 1
+                    continue
+
+            # 2) content_hash 기준 중복 체크 (URL이 다르거나 비어 있어도 동일 본문/기사 차단)
+            if content_hash:
+                if content_hash in seen_hashes_in_batch:
+                    skipped += 1
+                    continue
+                dst_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE content_hash = ? LIMIT 1;",
+                    (content_hash,),
+                )
+                if dst_cur.fetchone():
+                    seen_hashes_in_batch.add(content_hash)
+                    skipped += 1
+                    continue
+
+            # 3) URL도 해시도 없을 때 제목 기준 중복 체크
+            if not norm_url and not content_hash and title:
+                dst_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE TRIM(title) = ? LIMIT 1;",
+                    (title,),
+                )
+                if dst_cur.fetchone():
+                    skipped += 1
+                    continue
+
+            if not norm_url and not content_hash and not title:
                 skipped += 1
                 continue
 
-            pg_cur.execute("SELECT 1 FROM news_perspectives WHERE url = %s;", (url,))
-            if pg_cur.fetchone():
-                skipped += 1
-                continue
-
-            cat_id = _get_or_create_pg_category(pg_cur, r.get("category_name"))
-            src_id = _get_or_create_pg_source(pg_cur, r.get("source_name"))
+            cat_id = _get_or_create_sqlite_category(dst_cur, r.get("category_name"))
+            src_id = _get_or_create_sqlite_source(dst_cur, r.get("source_name"))
             issue_data = (
                 {
                     "issue_title": r.get("issue_title"),
@@ -500,48 +539,50 @@ def sync_sqlite_to_postgres(
                 if r.get("issue_title") or r.get("issue_hash")
                 else None
             )
-            issue_id = _get_or_create_pg_issue(pg_cur, issue_data, cat_id)
-            meta_obj = _parse_json_obj(r.get("metadata"))
+            issue_id = _get_or_create_sqlite_issue(dst_cur, issue_data, cat_id)
+            meta_json = json.dumps(_parse_json_obj(r.get("metadata")), ensure_ascii=False)
 
-            pg_cur.execute(
+            dst_cur.execute(
                 """
-                INSERT INTO news_perspectives (
+                INSERT OR IGNORE INTO news_perspectives (
                     issue_id, source_id, title, author_name, url,
                     summary_facts, author_opinion, stance_type, raw_content,
                     content_hash, thumbnail_url, processing_status,
                     model_version, metadata, published_at, created_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s, COALESCE(%s, CURRENT_TIMESTAMP)
-                )
-                ON CONFLICT (url) DO NOTHING;
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?
+                );
                 """,
                 (
                     issue_id,
                     src_id,
-                    r.get("title") or "",
+                    title,
                     r.get("author_name"),
-                    url,
+                    raw_url or None,
                     r.get("summary_facts"),
                     r.get("author_opinion"),
                     r.get("stance_type") or "중립",
                     r.get("raw_content"),
-                    r.get("content_hash"),
+                    content_hash or None,
                     r.get("thumbnail_url"),
                     r.get("processing_status") or "COMPLETED",
                     r.get("model_version"),
-                    Json(meta_obj),
-                    _parse_timestamp(r.get("published_at")),
-                    _parse_timestamp(r.get("created_at")),
+                    meta_json,
+                    r.get("published_at"),
+                    r.get("created_at"),
                 ),
             )
-            if pg_cur.rowcount and pg_cur.rowcount > 0:
+            if dst_cur.rowcount and dst_cur.rowcount > 0:
                 inserted += 1
+                if norm_url:
+                    seen_urls_in_batch.add(norm_url)
+                if content_hash:
+                    seen_hashes_in_batch.add(content_hash)
             else:
                 skipped += 1
-
         pg_conn.commit()
         return {
             "status": "ok",
@@ -635,73 +676,115 @@ def sync_postgres_to_sqlite(
 
         inserted = 0
         skipped = 0
+        seen_urls_in_batch: Set[str] = set()
+        seen_hashes_in_batch: Set[str] = set()
 
         for r in rows:
-            url = (r.get("url") or "").strip()
-            if not url:
+            raw_url = (r.get("url") or "").strip()
+            norm_url = raw_url.lower()
+            content_hash = (r.get("content_hash") or "").strip()
+            title = (r.get("title") or "").strip()
+
+            # 1) URL 기준 중복 체크 (현재 배치 + 기존 DB)
+            if norm_url:
+                if norm_url in seen_urls_in_batch:
+                    skipped += 1
+                    continue
+                pg_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE LOWER(TRIM(url)) = %s LIMIT 1;",
+                    (norm_url,),
+                )
+                if pg_cur.fetchone():
+                    seen_urls_in_batch.add(norm_url)
+                    skipped += 1
+                    continue
+
+            # 2) content_hash 기준 중복 체크 (URL이 다르거나 비어 있어도 동일 본문/기사 차단)
+            if content_hash:
+                if content_hash in seen_hashes_in_batch:
+                    skipped += 1
+                    continue
+                pg_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE content_hash = %s LIMIT 1;",
+                    (content_hash,),
+                )
+                if pg_cur.fetchone():
+                    seen_hashes_in_batch.add(content_hash)
+                    skipped += 1
+                    continue
+
+            # 3) URL도 해시도 없을 때 제목 기준 중복 체크
+            if not norm_url and not content_hash and title:
+                pg_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE TRIM(title) = %s LIMIT 1;",
+                    (title,),
+                )
+                if pg_cur.fetchone():
+                    skipped += 1
+                    continue
+
+            if not norm_url and not content_hash and not title:
                 skipped += 1
                 continue
 
-            sq_cur.execute("SELECT 1 FROM news_perspectives WHERE url = ?;", (url,))
-            if sq_cur.fetchone():
-                skipped += 1
-                continue
-
-            cat_id = _get_or_create_sqlite_category(sq_cur, r.get("category_name"))
-            src_id = _get_or_create_sqlite_source(sq_cur, r.get("source_name"))
+            cat_id = _get_or_create_pg_category(pg_cur, r.get("category_name"))
+            src_id = _get_or_create_pg_source(pg_cur, r.get("source_name"))
             issue_data = (
                 {
                     "issue_title": r.get("issue_title"),
                     "representative_summary": r.get("representative_summary"),
                     "keywords": _parse_keywords_list(r.get("keywords")),
                     "issue_hash": r.get("issue_hash"),
-                    "published_at": r.get("issue_published_at").isoformat() if isinstance(r.get("issue_published_at"), datetime) else r.get("issue_published_at"),
-                    "created_at": r.get("issue_created_at").isoformat() if isinstance(r.get("issue_created_at"), datetime) else r.get("issue_created_at"),
-                    "updated_at": r.get("issue_updated_at").isoformat() if isinstance(r.get("issue_updated_at"), datetime) else r.get("issue_created_at"),
+                    "published_at": r.get("issue_published_at"),
+                    "created_at": r.get("issue_created_at"),
+                    "updated_at": r.get("issue_updated_at"),
                 }
                 if r.get("issue_title") or r.get("issue_hash")
                 else None
             )
-            issue_id = _get_or_create_sqlite_issue(sq_cur, issue_data, cat_id)
-            meta_json = json.dumps(_parse_json_obj(r.get("metadata")), ensure_ascii=False)
-            pub_val = r.get("published_at")
-            crt_val = r.get("created_at")
+            issue_id = _get_or_create_pg_issue(pg_cur, issue_data, cat_id)
+            meta_obj = _parse_json_obj(r.get("metadata"))
 
-            sq_cur.execute(
+            pg_cur.execute(
                 """
-                INSERT OR IGNORE INTO news_perspectives (
+                INSERT INTO news_perspectives (
                     issue_id, source_id, title, author_name, url,
                     summary_facts, author_opinion, stance_type, raw_content,
                     content_hash, thumbnail_url, processing_status,
                     model_version, metadata, published_at, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?
-                );
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, COALESCE(%s, CURRENT_TIMESTAMP)
+                )
+                ON CONFLICT (url) DO NOTHING;
                 """,
                 (
                     issue_id,
                     src_id,
-                    r.get("title") or "",
+                    title,
                     r.get("author_name"),
-                    url,
+                    raw_url or None,
                     r.get("summary_facts"),
                     r.get("author_opinion"),
                     r.get("stance_type") or "중립",
                     r.get("raw_content"),
-                    r.get("content_hash"),
+                    content_hash or None,
                     r.get("thumbnail_url"),
                     r.get("processing_status") or "COMPLETED",
                     r.get("model_version"),
-                    meta_json,
-                    pub_val.isoformat() if isinstance(pub_val, datetime) else pub_val,
-                    crt_val.isoformat() if isinstance(crt_val, datetime) else crt_val,
+                    Json(meta_obj),
+                    _parse_timestamp(r.get("published_at")),
+                    _parse_timestamp(r.get("created_at")),
                 ),
             )
-            if sq_cur.rowcount and sq_cur.rowcount > 0:
+            if pg_cur.rowcount and pg_cur.rowcount > 0:
                 inserted += 1
+                if norm_url:
+                    seen_urls_in_batch.add(norm_url)
+                if content_hash:
+                    seen_hashes_in_batch.add(content_hash)
             else:
                 skipped += 1
 
@@ -1082,3 +1165,221 @@ def delete_news_by_filter(
     finally:
         cur.close()
         conn.close()
+
+
+REQUIRED_SQLITE_SCHEMA: Dict[str, Set[str]] = {
+    "categories": {"id", "name"},
+    "sources": {"id", "name"},
+    "news_issues": {"id", "issue_title", "category_id", "keywords", "issue_hash"},
+    "news_perspectives": {
+        "id",
+        "issue_id",
+        "source_id",
+        "title",
+        "url",
+        "summary_facts",
+        "author_opinion",
+        "stance_type",
+        "processing_status",
+        "published_at",
+        "created_at",
+    },
+}
+
+
+def validate_sqlite_file_schema(candidate_path: str) -> Dict[str, Any]:
+    """파일 이름과 무관하게 SQLite 헤더와 필수 테이블/컬럼 구조가 일치하는지 검증합니다."""
+    if not os.path.isfile(candidate_path):
+        return {"valid": False, "reason": "업로드된 파일을 찾을 수 없어요."}
+
+    try:
+        with open(candidate_path, "rb") as f:
+            header = f.read(16)
+        if header != b"SQLite format 3\x00":
+            return {"valid": False, "reason": "유효한 SQLite 3 데이터베이스 파일이 아니에요."}
+    except Exception as e:
+        return {"valid": False, "reason": f"파일 헤더를 읽을 수 없어요: {e}"}
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(f"file:{os.path.abspath(candidate_path)}?mode=ro", uri=True)
+        cur = conn.cursor()
+
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        existing_tables = {str(r[0]) for r in cur.fetchall()}
+
+        missing_tables = sorted(set(REQUIRED_SQLITE_SCHEMA.keys()) - existing_tables)
+        if missing_tables:
+            return {
+                "valid": False,
+                "reason": f"필수 테이블이 없어 구조가 맞지 않아요: {', '.join(missing_tables)}",
+            }
+
+        for table_name, required_cols in REQUIRED_SQLITE_SCHEMA.items():
+            cur.execute(f"PRAGMA table_info({table_name});")
+            actual_cols = {str(r[1]) for r in cur.fetchall()}
+            missing_cols = sorted(required_cols - actual_cols)
+            if missing_cols:
+                return {
+                    "valid": False,
+                    "reason": f"`{table_name}` 테이블에 필수 컬럼이 없어요: {', '.join(missing_cols)}",
+                }
+
+        cur.execute("SELECT COUNT(*) FROM news_perspectives;")
+        row_count = int(cur.fetchone()[0] or 0)
+        return {"valid": True, "row_count": row_count}
+    except sqlite3.DatabaseError as e:
+        return {"valid": False, "reason": f"손상되었거나 열 수 없는 SQLite 파일이에요: {e}"}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def import_sqlite_file_data(
+    uploaded_sqlite_path: str,
+    target_sqlite_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    업로드된 SQLite 파일의 스키마를 먼저 검증한 뒤,
+    구조가 일치할 때만 대상 SQLite DB에 데이터를 병합합니다(중복 URL 스킵).
+    """
+    check = validate_sqlite_file_schema(uploaded_sqlite_path)
+    if not check.get("valid"):
+        return {
+            "status": "rejected",
+            "inserted_count": 0,
+            "skipped_count": 0,
+            "message": check.get("reason") or "파일 구조가 일치하지 않아 반영하지 않았어요.",
+        }
+
+    target_file = _resolve_sqlite_path(target_sqlite_path)
+    os.makedirs(os.path.dirname(target_file) or ".", exist_ok=True)
+
+    src_conn = sqlite3.connect(f"file:{os.path.abspath(uploaded_sqlite_path)}?mode=ro", uri=True)
+    src_conn.row_factory = sqlite3.Row
+    src_cur = src_conn.cursor()
+
+    dst_conn = sqlite3.connect(target_file, timeout=15.0)
+    dst_conn.execute("PRAGMA journal_mode=WAL;")
+    dst_conn.execute("PRAGMA busy_timeout=5000;")
+    dst_conn.execute("PRAGMA foreign_keys=ON;")
+    _ensure_sqlite_tables(dst_conn)
+    dst_cur = dst_conn.cursor()
+
+    try:
+        src_cur.execute(
+            """
+            SELECT
+                p.*,
+                s.name AS source_name,
+                i.issue_title,
+                i.representative_summary,
+                i.keywords,
+                i.issue_hash,
+                i.published_at AS issue_published_at,
+                i.created_at AS issue_created_at,
+                i.updated_at AS issue_updated_at,
+                c.name AS category_name
+            FROM news_perspectives p
+            LEFT JOIN sources s ON p.source_id = s.id
+            LEFT JOIN news_issues i ON p.issue_id = i.id
+            LEFT JOIN categories c ON i.category_id = c.id
+            ORDER BY p.id ASC;
+            """
+        )
+        rows = [dict(r) for r in src_cur.fetchall()]
+
+        inserted = 0
+        skipped = 0
+
+        for r in rows:
+            url = (r.get("url") or "").strip()
+            if not url:
+                skipped += 1
+                continue
+
+            dst_cur.execute("SELECT 1 FROM news_perspectives WHERE url = ?;", (url,))
+            if dst_cur.fetchone():
+                skipped += 1
+                continue
+
+            cat_id = _get_or_create_sqlite_category(dst_cur, r.get("category_name"))
+            src_id = _get_or_create_sqlite_source(dst_cur, r.get("source_name"))
+            issue_data = (
+                {
+                    "issue_title": r.get("issue_title"),
+                    "representative_summary": r.get("representative_summary"),
+                    "keywords": _parse_keywords_list(r.get("keywords")),
+                    "issue_hash": r.get("issue_hash"),
+                    "published_at": r.get("issue_published_at"),
+                    "created_at": r.get("issue_created_at"),
+                    "updated_at": r.get("issue_updated_at"),
+                }
+                if r.get("issue_title") or r.get("issue_hash")
+                else None
+            )
+            issue_id = _get_or_create_sqlite_issue(dst_cur, issue_data, cat_id)
+            meta_json = json.dumps(_parse_json_obj(r.get("metadata")), ensure_ascii=False)
+
+            dst_cur.execute(
+                """
+                INSERT OR IGNORE INTO news_perspectives (
+                    issue_id, source_id, title, author_name, url,
+                    summary_facts, author_opinion, stance_type, raw_content,
+                    content_hash, thumbnail_url, processing_status,
+                    model_version, metadata, published_at, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?
+                );
+                """,
+                (
+                    issue_id,
+                    src_id,
+                    r.get("title") or "",
+                    r.get("author_name"),
+                    url,
+                    r.get("summary_facts"),
+                    r.get("author_opinion"),
+                    r.get("stance_type") or "중립",
+                    r.get("raw_content"),
+                    r.get("content_hash"),
+                    r.get("thumbnail_url"),
+                    r.get("processing_status") or "COMPLETED",
+                    r.get("model_version"),
+                    meta_json,
+                    r.get("published_at"),
+                    r.get("created_at"),
+                ),
+            )
+            if dst_cur.rowcount and dst_cur.rowcount > 0:
+                inserted += 1
+            else:
+                skipped += 1
+
+        dst_conn.commit()
+        dst_cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        dst_conn.commit()
+
+        return {
+            "status": "ok",
+            "fetched_count": len(rows),
+            "inserted_count": inserted,
+            "skipped_count": skipped,
+            "sqlite_path": target_file,
+        }
+    except Exception as e:
+        dst_conn.rollback()
+        return {
+            "status": "error",
+            "inserted_count": 0,
+            "skipped_count": 0,
+            "message": f"SQLite 데이터 병합 중 오류가 발생해 롤백했어요: {e}",
+        }
+    finally:
+        src_cur.close()
+        src_conn.close()
+        dst_cur.close()
+        dst_conn.close()

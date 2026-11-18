@@ -13,6 +13,13 @@ from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_MCP_DIR = os.path.join(_BASE_DIR, "mcp")
+
+for _p in (_BASE_DIR, _MCP_DIR):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from tool_rag_router import MCP_TOOL_REGISTRY, retrieve_top_tools
 load_dotenv()
 
@@ -31,8 +38,7 @@ def set_crawling(active: bool) -> None:
         _IS_CRAWLING = active
 
 
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_MCP_DIR = os.path.join(_BASE_DIR, "mcp")
+
 
 for _p in (_BASE_DIR, _MCP_DIR):
     if os.path.isdir(_p) and _p not in sys.path:
@@ -66,8 +72,9 @@ from sqlite_store import init_sqlite_db
 from storage_backend import (
     DEFAULT_SQLITE_PATH,
     get_active_storage_backend,
+    import_sqlite_file_data,
 )
-
+_IMPORT_LOCK = threading.Lock()
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
 TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
@@ -320,7 +327,33 @@ def _route_tool_group(user_text: str) -> str:
     print(f"[DEBUG] text={user_text!r} -> parsed={parsed}", file=sys.stderr)
     return group if group in ("storage", "content", "none") else "none"
 
+import tempfile
+from storage_backend import import_sqlite_file_data
 
+
+def _download_slack_file(file_info: Dict[str, Any]) -> str:
+    """Slack 첨부파일을 임시 파일로 다운로드하고 경로를 반환합니다."""
+    url = file_info.get("url_private_download") or file_info.get("url_private")
+    if not url:
+        raise ValueError("Slack 파일 다운로드 URL이 없어요.")
+
+    bot_token = (os.environ.get("SLACK_BOT_TOKEN") or "").strip()
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {bot_token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    fd, tmp_path = tempfile.mkstemp(prefix="slack_import_", suffix=".sqlite")
+    try:
+        with os.fdopen(fd, "wb") as tmp_f:
+            tmp_f.write(resp.content)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    return tmp_path
 
 def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
     """키워드/태그/그룹(+선택적 임베딩)으로 추린 상위 3개 도구만 LLM에 넘겨 JSON 인자를 추출."""
@@ -407,6 +440,47 @@ def handle_mention(event, say, client):
     help_topic = parse_help_topic(user_text)
     if help_topic:
         say(text=get_rss_crawling_guide(help_topic))
+        return
+    
+    attached_files = event.get("files") or []
+    if attached_files:
+        with _IMPORT_LOCK:
+            for file_info in attached_files:
+                orig_name = file_info.get("name") or "uploaded_file"
+                tmp_path = None
+                try:
+                    tmp_path = _download_slack_file(file_info)
+                    result = import_sqlite_file_data(
+                        uploaded_sqlite_path=tmp_path,
+                        target_sqlite_path=DEFAULT_SQLITE_PATH,
+                    )
+                except Exception as e:
+                    say(text=f"❌ `{orig_name}` 파일을 가져오는 중 실패했어요: {e}")
+                    continue
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+                status = result.get("status")
+                if status == "ok":
+                    say(
+                        text=(
+                            f"📥 *SQLite 데이터 복원/병합 완료* (`{orig_name}`)\n"
+                            f"• 파일 내 전체 기사: {result.get('fetched_count', 0)}건\n"
+                            f"• 신규 반영: *{result.get('inserted_count', 0)}건*\n"
+                            f"• 중복 건너뜀: {result.get('skipped_count', 0)}건"
+                        )
+                    )
+                elif status == "rejected":
+                    say(
+                        text=(
+                            f"🚫 *파일 반영 거절* (`{orig_name}`)\n"
+                            f"• 사유: {result.get('message')}\n"
+                            f"• 기존 저장소 데이터는 변경되지 않았어요."
+                        )
+                    )
+                else:
+                    say(text=f"⚠️ 복원 실패 (`{orig_name}`): {result.get('message')}")
         return
 
     if not user_text:
@@ -705,7 +779,6 @@ def handle_mention(event, say, client):
         )
         return
 
-    say(text="그런 기능은 없어요.")
 
 
 if __name__ == "__main__":
