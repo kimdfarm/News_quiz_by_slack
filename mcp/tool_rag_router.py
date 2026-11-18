@@ -151,6 +151,37 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
             "limit": "정수 (기본 3)",
         },
     },
+    {
+        "tool": "schedule_rss_collection",
+        "group": "content",
+        "tags": [
+            "주기", "마다", "간격", "동안", "까지", "시간", "분", "초",
+            "요일", "주", "내일", "모레", "년", "월", "일", "예약", "자동",
+            "수집", "크롤링", "모아줘", "가져와", "긁어와", "뉴스", "기사", "rss",
+        ],
+        "description": (
+            "현재 시각 기준으로 지정한 기간(시/분/초 동안) 또는 목표 시각/날짜/요일(L시까지, 내일/금요일/연월일)까지 "
+            "지정한 간격(시/분/초마다, 기본 30분)으로 RSS 뉴스를 반복 수집한다."
+        ),
+        "examples": [
+            "2시간 30분 15초 동안 15분마다 경제 뉴스 3개씩 모아줘",
+            "오늘 밤 11시 30분까지 10분마다 정치 기사 2개씩 수집해줘",
+            "다음주 금요일 18시까지 1시간 30분마다 IT 뉴스 가져와줘",
+            "2026년 11월 25일 09시 00분까지 30분마다 뉴스 수집해줘",
+        ],
+        "schema": {
+            "tool": "schedule_rss_collection",
+            "mode": "duration | until",
+            "duration_hours": "실수 또는 정수 (기본 0)",
+            "duration_minutes": "실수 또는 정수 (기본 0)",
+            "duration_seconds": "실수 또는 정수 (기본 0)",
+            "until_iso": "YYYY-MM-DD HH:MM:SS 형식 목표 시각(until 모드일 때) 또는 null",
+            "interval_hours": "실수 또는 정수 (기본 0)",
+            "interval_minutes": "실수 또는 정수 (기본 30, 다른 간격 지정 시 0 가능)",
+            "interval_seconds": "실수 또는 정수 (기본 0)",
+            "request_text": "수집 대상/건수 요청 문장(예: '경제 뉴스 3개씩 수집')",
+        },
+    },
 ]
 
 GROUP_HINTS: Dict[str, Set[str]] = {
@@ -291,6 +322,53 @@ def retrieve_top_tools(
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     if min_score > 0:
-        filtered = [item for score, item in scored if score >= min_score]
-        return filtered[:top_k]
-    return [item for _, item in scored[:top_k]]
+        selected = [item for score, item in scored if score >= min_score][:top_k]
+    else:
+        selected = [item for _, item in scored[:top_k]]
+
+    return ensure_rss_pair_in_candidates(
+        top_tools=selected,
+        registry=MCP_TOOL_REGISTRY,
+        max_k=max(top_k, 4),
+    )
+
+
+def ensure_rss_pair_in_candidates(
+    top_tools: List[Dict[str, Any]],
+    registry: List[Dict[str, Any]],
+    max_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """단발 RSS와 주기 RSS가 서로 비교 가능하도록 후보군에 함께 포함."""
+    by_name = {item["tool"]: item for item in registry}
+    present = {item["tool"] for item in top_tools}
+
+    has_one_shot = "run_rss_by_request" in present
+    has_sched = "schedule_rss_collection" in present
+
+    if not (has_one_shot or has_sched):
+        return top_tools
+
+    result = list(top_tools)
+    for peer_name in ("run_rss_by_request", "schedule_rss_collection"):
+        if peer_name not in present and peer_name in by_name:
+            result.append(by_name[peer_name])
+            present.add(peer_name)
+
+    # 원래 max_k를 넘겼다면, 방금 보장한 두 도구는 유지하면서 뒤쪽 여유분만 정리
+    if len(result) > max_k:
+        protected = {"run_rss_by_request", "schedule_rss_collection"}
+        trimmed: List[Dict[str, Any]] = []
+        for item in result:
+            if item["tool"] in protected or len(trimmed) < max_k - len(protected):
+                trimmed.append(item)
+        # 보호 대상이 빠지지 않도록 합집합 유지
+        existing_names = {x["tool"] for x in trimmed}
+        for item in result:
+            if item["tool"] in protected and item["tool"] not in existing_names:
+                trimmed.append(item)
+        result = trimmed
+
+    return result
+
+
+
