@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import traceback
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,14 +21,28 @@ from mcp.server.mcpserver import MCPServer
 
 from crawler.news.plan_sources_from_request import plan_sources_from_request
 from crawler.rss_base_crawler import crawl_multiple_rss_sources
+from database import get_db_connection
+from sqlite_store import get_sqlite_conn, init_sqlite_db
 from storage_backend import (
     DEFAULT_SQLITE_PATH,
     fetch_recent_news,
     get_active_storage_backend,
+    normalize_storage_backend,
     set_active_storage_backend,
+    sync_postgres_to_sqlite as _sync_pg_to_sq,
+    sync_sqlite_to_postgres as _sync_sq_to_pg,
 )
 
 mcp = MCPServer("news-quiz-mcp")
+
+
+def _resolve_sqlite_target(sqlite_path: Optional[str] = None) -> str:
+    raw = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or DEFAULT_SQLITE_PATH).strip()
+    if not os.path.isabs(raw) and not os.path.exists(raw):
+        candidate = os.path.join(_ROOT_DIR, "SQLITE", os.path.basename(raw))
+        if os.path.exists(candidate):
+            raw = candidate
+    return os.path.abspath(raw)
 
 
 @mcp.tool()
@@ -38,7 +53,7 @@ def set_storage_backend(storage_backend: str) -> str:
         {
             "status": "ok",
             "STORAGE_BACKEND": updated,
-            "sqlite_path": DEFAULT_SQLITE_PATH if updated == "sqlite" else None,
+            "sqlite_path": _resolve_sqlite_target() if updated == "sqlite" else None,
         },
         ensure_ascii=False,
     )
@@ -52,7 +67,7 @@ def get_recent_news_for_quiz(
     sqlite_path: Optional[str] = None,
 ) -> str:
     """최근 뉴스 데이터를 조회합니다."""
-    path = sqlite_path or os.getenv("NEWS_SQLITE_PATH", DEFAULT_SQLITE_PATH)
+    path = _resolve_sqlite_target(sqlite_path)
     result = fetch_recent_news(
         category=category,
         limit=limit,
@@ -71,9 +86,7 @@ def run_rss_sources(
     sqlite_path: Optional[str] = None,
 ) -> str:
     """추론된 sources_config와 limit, storage_mode로 crawl_multiple_rss_sources를 실행합니다."""
-    from crawler.rss_base_crawler import crawl_multiple_rss_sources
-
-    path = sqlite_path or os.getenv("NEWS_SQLITE_PATH", DEFAULT_SQLITE_PATH)
+    path = _resolve_sqlite_target(sqlite_path)
     total = crawl_multiple_rss_sources(
         sources_config=sources_config,
         limit=limit,
@@ -83,21 +96,15 @@ def run_rss_sources(
     return json.dumps({"processed_total": total}, ensure_ascii=False)
 
 
-import contextlib
-import sys
-import traceback
-
 @mcp.tool()
 def run_rss_by_request(
     request_text: str,
     storage_mode: Optional[str] = None,
     sqlite_path: Optional[str] = None,
-    
 ) -> str:
     """자연어 요청을 해석해 요청 맞춤형 sources_config와 limit를 구성하고 crawl_multiple_rss_sources를 실행합니다."""
     try:
-
-        sq_path = sqlite_path or os.getenv("NEWS_SQLITE_PATH", DEFAULT_SQLITE_PATH)
+        sq_path = _resolve_sqlite_target(sqlite_path)
 
         with contextlib.redirect_stdout(sys.stderr):
             planned = plan_sources_from_request(
@@ -134,19 +141,11 @@ def run_rss_by_request(
         traceback.print_exc(file=sys.stderr)
         raise RuntimeError(f"run_rss_by_request 실패 ({type(e).__name__}): {e}") from e
 
+
 @mcp.tool()
 def export_sqlite_file(sqlite_path: Optional[str] = None) -> str:
     """SQLite DB 파일(news_store.sqlite)의 경로와 파일 정보를 확인해 다운로드용 메타데이터를 반환합니다."""
-    default_file = os.path.join(_ROOT_DIR, "SQLITE", "news_store.sqlite")
-    raw_path = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or default_file).strip()
-
-    # 상대경로나 파일명만 들어온 경우 SQLITE 폴더 기준으로 보정
-    if not os.path.isabs(raw_path) and not os.path.exists(raw_path):
-        candidate = os.path.join(_ROOT_DIR, "SQLITE", os.path.basename(raw_path))
-        if os.path.exists(candidate):
-            raw_path = candidate
-
-    abs_path = os.path.abspath(raw_path)
+    abs_path = _resolve_sqlite_target(sqlite_path)
     if not os.path.isfile(abs_path):
         return json.dumps(
             {
@@ -172,14 +171,8 @@ def export_sqlite_file(sqlite_path: Optional[str] = None) -> str:
 @mcp.tool()
 def get_storage_status(sqlite_path: Optional[str] = None) -> str:
     """현재 활성 저장소 모드와 SQLite / Postgres 연결 및 파일 상태를 반환합니다."""
-    from datetime import datetime
-    from storage_backend import (
-        DEFAULT_SQLITE_PATH as BACKEND_DEFAULT_SQLITE,
-        get_active_storage_backend,
-    )
-
     active_mode = get_active_storage_backend()
-    target_sqlite = os.path.abspath((sqlite_path or os.getenv("NEWS_SQLITE_PATH") or BACKEND_DEFAULT_SQLITE).strip())
+    target_sqlite = _resolve_sqlite_target(sqlite_path)
 
     sqlite_info: Dict[str, Any] = {
         "path": target_sqlite,
@@ -200,8 +193,6 @@ def get_storage_status(sqlite_path: Optional[str] = None) -> str:
     }
     if db_url:
         try:
-            from database import get_db_connection
-
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("SELECT 1;")
@@ -222,19 +213,13 @@ def get_storage_status(sqlite_path: Optional[str] = None) -> str:
         ensure_ascii=False,
     )
 
+
 @mcp.tool()
 def get_storage_stats(
     target_backend: Optional[str] = None,
     sqlite_path: Optional[str] = None,
 ) -> str:
     """현재 또는 지정된 저장소(sqlite / postgres)의 기사 통계(총 건수, 언론사별/분야별 건수, 최근 수집 시각)를 반환합니다."""
-    import sqlite3
-    from storage_backend import (
-        DEFAULT_SQLITE_PATH as BACKEND_DEFAULT_SQLITE,
-        get_active_storage_backend,
-        normalize_storage_backend,
-    )
-
     active_mode = get_active_storage_backend()
     if target_backend and str(target_backend).strip():
         chosen_mode = normalize_storage_backend(target_backend)
@@ -242,9 +227,7 @@ def get_storage_stats(
         chosen_mode = active_mode
 
     if chosen_mode == "sqlite":
-        db_file = os.path.abspath(
-            (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or BACKEND_DEFAULT_SQLITE).strip()
-        )
+        db_file = _resolve_sqlite_target(sqlite_path)
         if not os.path.isfile(db_file):
             return json.dumps(
                 {
@@ -256,7 +239,7 @@ def get_storage_stats(
                 ensure_ascii=False,
             )
 
-        conn = sqlite3.connect(db_file)
+        conn = get_sqlite_conn(db_path=db_file, read_only=True)
         cur = conn.cursor()
         try:
             cur.execute("SELECT COUNT(*) FROM news_perspectives;")
@@ -288,13 +271,13 @@ def get_storage_stats(
             by_category = [{"name": r[0], "count": int(r[1])} for r in cur.fetchall()]
 
             cur.execute(
-            """
-            SELECT
-                MIN(COALESCE(published_at, created_at)),
-                MAX(COALESCE(published_at, created_at))
-            FROM news_perspectives;
-            """
-        )
+                """
+                SELECT
+                    MIN(COALESCE(published_at, created_at)),
+                    MAX(COALESCE(published_at, created_at))
+                FROM news_perspectives;
+                """
+            )
             oldest_at, latest_at = cur.fetchone()
         finally:
             cur.close()
@@ -328,8 +311,6 @@ def get_storage_stats(
         )
 
     try:
-        from database import get_db_connection
-
         conn = get_db_connection()
         cur = conn.cursor()
         try:
@@ -362,13 +343,13 @@ def get_storage_stats(
             by_category = [{"name": r[0], "count": int(r[1])} for r in cur.fetchall()]
 
             cur.execute(
-            """
-            SELECT
-                MIN(COALESCE(published_at::text, created_at::text)),
-                MAX(COALESCE(published_at::text, created_at::text))
-            FROM news_perspectives;
-            """
-        )
+                """
+                SELECT
+                    MIN(COALESCE(published_at::text, created_at::text)),
+                    MAX(COALESCE(published_at::text, created_at::text))
+                FROM news_perspectives;
+                """
+            )
             oldest_at, latest_at = cur.fetchone()
         finally:
             cur.close()
@@ -398,6 +379,7 @@ def get_storage_stats(
             ensure_ascii=False,
         )
 
+
 @mcp.tool()
 def sync_sqlite_to_postgres(
     limit: Optional[int] = None,
@@ -406,9 +388,7 @@ def sync_sqlite_to_postgres(
     """로컬 SQLite(news_store.sqlite)의 기사를 Neon DB(PostgreSQL)로 동기화합니다.
     limit을 지정하면 최근 N건만, 지정하지 않으면 전체를 대상으로 하며 중복 URL은 건너뜁니다.
     """
-    from storage_backend import sync_sqlite_to_postgres as _sync_sq_to_pg
-
-    result = _sync_sq_to_pg(limit=limit, sqlite_path=sqlite_path)
+    result = _sync_sq_to_pg(limit=limit, sqlite_path=_resolve_sqlite_target(sqlite_path))
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -420,18 +400,17 @@ def sync_postgres_to_sqlite(
     """Neon DB(PostgreSQL)의 기사를 로컬 SQLite(news_store.sqlite)로 동기화합니다.
     limit을 지정하면 최근 N건만, 지정하지 않으면 전체를 대상으로 하며 중복 URL은 건너뜁니다.
     """
-    from storage_backend import sync_postgres_to_sqlite as _sync_pg_to_sq
-
-    result = _sync_pg_to_sq(limit=limit, sqlite_path=sqlite_path)
+    result = _sync_pg_to_sq(limit=limit, sqlite_path=_resolve_sqlite_target(sqlite_path))
     return json.dumps(result, ensure_ascii=False)
 
 
-
-
-
-
-
-
-
 if __name__ == "__main__":
+    current_backend = get_active_storage_backend()
+    if current_backend == "postgres" and os.getenv("DATABASE_URL"):
+        from database import init_db
+
+        init_db()
+    elif current_backend == "sqlite":
+        init_sqlite_db(_resolve_sqlite_target())
+
     mcp.run(transport="stdio")

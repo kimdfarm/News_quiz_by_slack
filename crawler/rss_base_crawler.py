@@ -1,28 +1,29 @@
-import sys
+import hashlib
+import html
+import json
 import os
 import re
-import json
-import html
+import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
-from typing import Union, List, Optional
+from typing import Callable, List, Optional, Union
 
-import requests
-import feedparser
 from bs4 import BeautifulSoup
-import trafilatura
 from dotenv import load_dotenv
-
-from langchain_core.prompts import ChatPromptTemplate
+import feedparser
 from langchain_core.output_parsers import JsonOutputParser
-from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
+import requests
+import trafilatura
 
 load_dotenv()
-DEFAULT_STORAGE_BACKEND = (os.getenv("STORAGE_BACKEND") or "postgres").strip().lower()
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(BASE_DIR)  # news/의 상위 폴더
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
 SQLITE_DIR = os.path.join(PROJECT_ROOT, "SQLITE")
 
 _raw_sqlite_name = os.path.basename((os.getenv("NEWS_SQLITE_PATH") or "news_store.sqlite").strip())
@@ -43,12 +44,45 @@ except ImportError:
         normalize_storage_mode,
     )
 
+# 데이터 수집(크롤링) 실행 시에만 LangSmith 트레이싱 비활성화
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGSMITH_TRACING"] = "false"
+os.environ["LANGCHAIN_ENDPOINT"] = ""
+os.environ["LANGSMITH_ENDPOINT"] = ""
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from database import (
+    compute_text_similarity,
+    generate_content_hash,
+    get_db_connection,
+    save_news_article,
+)
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, text/html, */*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+_CACHED_CHAIN = None
+_CACHED_CHAIN_LABEL = None
+MIN_LLM_CONTENT_CHARS = int(os.getenv("MIN_LLM_CONTENT_CHARS", "120"))
+_LAST_USED_MODEL = None
+
 
 def _resolve_storage_mode(storage_mode: Optional[str] = None) -> str:
     explicit = normalize_storage_mode(storage_mode)
     if explicit in ("sqlite", "postgres"):
         return explicit
     return get_persisted_storage_mode()
+
 
 def _import_sqlite_store():
     candidate_dirs = [
@@ -64,23 +98,33 @@ def _import_sqlite_store():
 
     for mod_name in ("sqlite_store", "crawler.sqlite_store", "crawler.news.sqlite_store"):
         try:
-            mod = __import__(mod_name, fromlist=["get_existing_urls_sqlite", "save_news_article_sqlite"])
-            if hasattr(mod, "get_existing_urls_sqlite") and hasattr(mod, "save_news_article_sqlite"):
+            mod = __import__(
+                mod_name,
+                fromlist=["init_sqlite_db", "get_existing_urls_sqlite", "save_news_article_sqlite"],
+            )
+            if (
+                hasattr(mod, "get_existing_urls_sqlite")
+                and hasattr(mod, "save_news_article_sqlite")
+            ):
                 return mod
         except ImportError:
             continue
 
     raise ModuleNotFoundError("sqlite_store 모듈을 찾을 수 없습니다. sqlite_store.py 위치를 확인해 주세요.")
 
+
 def _resolve_sqlite_path(sqlite_path: Optional[str] = None) -> str:
     cleaned = (sqlite_path or "").strip()
     return cleaned if cleaned else DEFAULT_SQLITE_PATH
+
 
 def _fetch_existing_urls_by_mode(urls: list, mode: str, sqlite_path: Optional[str]) -> set:
     try:
         if mode == "sqlite":
             effective_sqlite = _resolve_sqlite_path(sqlite_path)
             sqlite_store = _import_sqlite_store()
+            if hasattr(sqlite_store, "init_sqlite_db"):
+                sqlite_store.init_sqlite_db(effective_sqlite)
             result = sqlite_store.get_existing_urls_sqlite(urls, db_path=effective_sqlite)
         else:
             result = get_existing_urls(urls)
@@ -98,30 +142,6 @@ def _persist_article_by_mode(article_data: dict, mode: str, sqlite_path: Optiona
         return
     save_news_article(article_data)
 
-# 데이터 수집(크롤링) 실행 시에만 LangSmith 트레이싱 비활성화
-os.environ["LANGCHAIN_TRACING_V2"] = "false"
-os.environ["LANGSMITH_TRACING"] = "false"
-os.environ["LANGCHAIN_ENDPOINT"] = ""
-os.environ["LANGSMITH_ENDPOINT"] = ""
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from database import save_news_article, compute_text_similarity, generate_content_hash,url_exists , get_db_connection
-from langchain_core.runnables import RunnableLambda
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/rss+xml, application/xml, text/xml, text/html, */*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-_CACHED_CHAIN = None
-_CACHED_CHAIN_LABEL = None
-MIN_LLM_CONTENT_CHARS = int(os.getenv("MIN_LLM_CONTENT_CHARS", "120"))
-
-_LAST_USED_MODEL = None
-
 
 def _wrap_with_model_tracker(chain, model_label: str):
     def _mark_success(output):
@@ -130,6 +150,20 @@ def _wrap_with_model_tracker(chain, model_label: str):
         return output
 
     return chain | RunnableLambda(_mark_success)
+
+
+def _get_groq_model_queue() -> List[str]:
+    raw_list = os.getenv("GROQ_MODELS", "").strip()
+    if raw_list:
+        models = [m.strip() for m in raw_list.split(",") if m.strip()]
+        if models:
+            return list(dict.fromkeys(models))
+
+    primary = (os.getenv("GROQ_MODEL") or "qwen/qwen3.8-27b").strip()
+    fallbacks_raw = os.getenv("GROQ_FALLBACK_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b").strip()
+    fallbacks = [m.strip() for m in fallbacks_raw.split(",") if m.strip()]
+    return list(dict.fromkeys([primary] + fallbacks))
+
 
 def _get_or_build_chain():
     global _CACHED_CHAIN, _CACHED_CHAIN_LABEL
@@ -178,7 +212,7 @@ def _get_or_build_chain():
             groq_chain = (prompt | groq_llm | parser).with_config({"run_name": label})
             chains.append(_wrap_with_model_tracker(groq_chain, label))
             labels.append(label)
-            
+
     if use_ollama:
         ollama_llm = ChatOllama(model=ollama_model_name, base_url=ollama_base_url, temperature=0.1)
         ollama_chain = (prompt | ollama_llm | parser).with_config({"run_name": f"ollama:{ollama_model_name}"})
@@ -195,8 +229,6 @@ def _get_or_build_chain():
     _CACHED_CHAIN = primary
     _CACHED_CHAIN_LABEL = " -> ".join(labels)
     return _CACHED_CHAIN, _CACHED_CHAIN_LABEL
-
-
 
 
 def get_existing_urls(urls: list) -> set:
@@ -216,6 +248,7 @@ def get_existing_urls(urls: list) -> set:
     finally:
         cur.close()
         conn.close()
+
 
 def _clean_text(text: Optional[str]) -> str:
     if not text:
@@ -258,6 +291,7 @@ def _parse_pub_date(raw_date: Optional[str], entry=None) -> datetime:
 
     return datetime.now()
 
+
 def _fetch_xml_bytes(rss_url: str) -> Optional[bytes]:
     headers = {
         **DEFAULT_HEADERS,
@@ -269,7 +303,6 @@ def _fetch_xml_bytes(rss_url: str) -> Optional[bytes]:
         "DNT": "1",
     }
 
-    # 1) requests.Session 시도
     last_err: Optional[Exception] = None
     try:
         with requests.Session() as sess:
@@ -279,7 +312,6 @@ def _fetch_xml_bytes(rss_url: str) -> Optional[bytes]:
     except Exception as e:
         last_err = e
 
-    # 2) cloudscraper 폴백 (설치된 경우)
     try:
         import cloudscraper  # type: ignore
 
@@ -294,7 +326,6 @@ def _fetch_xml_bytes(rss_url: str) -> Optional[bytes]:
     except Exception as e:
         last_err = e
 
-    # 3) curl_cffi 폴백 (설치된 경우)
     try:
         from curl_cffi import requests as cffi_requests  # type: ignore
 
@@ -308,6 +339,7 @@ def _fetch_xml_bytes(rss_url: str) -> Optional[bytes]:
 
     print(f"  [!] RSS HTTP 요청 실패 ({rss_url}): {last_err}", file=sys.stderr)
     return None
+
 
 def parse_rss_items(rss_url: str) -> List[dict]:
     raw_xml = _fetch_xml_bytes(rss_url)
@@ -367,36 +399,49 @@ def parse_rss_items(rss_url: str) -> List[dict]:
     return items
 
 
-def _extract_html_with_bs4(html_text: str) -> str:
+def _extract_arc_fusion_content(html_text: str) -> str:
+    """조선일보 등 Arc Publishing(<script id='fusion-metadata'>) JSON에서 본문 텍스트를 추출합니다."""
     soup = BeautifulSoup(html_text, "html.parser")
-    for tag in soup(["script", "style", "noscript", "iframe", "header", "footer", "nav", "aside"]):
-        tag.decompose()
+    script_tag = soup.find("script", id="fusion-metadata")
+    script_body = script_tag.string or script_tag.get_text() if script_tag else html_text
 
-    for sel in (
-        "#article-view-content-div",
-        ".article-view-content",
-        "#articleBody",
-        ".article_body",
-        ".news_cnt_detail_wrap",
-        "article",
-    ):
-        el = soup.select_one(sel)
-        if el:
-            paragraphs = [
-                _clean_text(p.get_text(" ", strip=True))
-                for p in el.find_all(["p", "div"])
-                if len(_clean_text(p.get_text(" ", strip=True))) >= 25
-            ]
-            joined = "\n".join(dict.fromkeys(paragraphs))
-            if len(joined) >= 80:
-                return joined
+    marker = "Fusion.globalContent="
+    idx = script_body.find(marker)
+    if idx == -1:
+        marker = "Fusion.globalContent ="
+        idx = script_body.find(marker)
+    if idx == -1:
+        return ""
 
-    return _clean_text(soup.get_text(" ", strip=True))
+    json_start = script_body.find("{", idx)
+    if json_start == -1:
+        return ""
+
+    try:
+        decoder = json.JSONDecoder()
+        data, _ = decoder.raw_decode(script_body, json_start)
+    except Exception:
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+
+    paragraphs: List[str] = []
+    for el in data.get("content_elements") or []:
+        if not isinstance(el, dict):
+            continue
+        el_type = el.get("type")
+        if el_type in ("text", "raw_html", "header"):
+            raw = el.get("content") or ""
+            clean = _clean_text(BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
+            if clean:
+                paragraphs.append(clean)
+
+    return "\n".join(paragraphs)
 
 
 def fetch_article_details(url: str) -> dict:
     result = {"raw_content": "", "author": "", "thumbnail": "", "final_url": url}
-    
     if not url:
         return result
 
@@ -442,45 +487,6 @@ def fetch_article_details(url: str) -> dict:
         print(f"  [!] 본문 스크래핑 실패 ({url}): {e}", file=sys.stderr)
         return result
 
-def _extract_arc_fusion_content(html_text: str) -> str:
-    """조선일보 등 Arc Publishing(<script id='fusion-metadata'>) JSON에서 본문 텍스트를 추출합니다."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    script_tag = soup.find("script", id="fusion-metadata")
-    script_body = script_tag.string or script_tag.get_text() if script_tag else html_text
-
-    marker = "Fusion.globalContent="
-    idx = script_body.find(marker)
-    if idx == -1:
-        marker = "Fusion.globalContent ="
-        idx = script_body.find(marker)
-    if idx == -1:
-        return ""
-
-    json_start = script_body.find("{", idx)
-    if json_start == -1:
-        return ""
-
-    try:
-        decoder = json.JSONDecoder()
-        data, _ = decoder.raw_decode(script_body, json_start)
-    except Exception:
-        return ""
-
-    if not isinstance(data, dict):
-        return ""
-
-    paragraphs: List[str] = []
-    for el in data.get("content_elements") or []:
-        if not isinstance(el, dict):
-            continue
-        el_type = el.get("type")
-        if el_type in ("text", "raw_html", "header"):
-            raw = el.get("content") or ""
-            clean = _clean_text(BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
-            if clean:
-                paragraphs.append(clean)
-
-    return "\n".join(paragraphs)
 
 def _build_default_analysis(title: str, raw_content: str, category: str) -> dict:
     clean_text = (raw_content or title or "").strip()
@@ -493,77 +499,7 @@ def _build_default_analysis(title: str, raw_content: str, category: str) -> dict
         "keywords": [category] if category else ["뉴스"],
         "model_used": "fallback_raw",
     }
-def _get_groq_model_queue() -> List[str]:
-    """환경변수에서 우선순위 순서대로 사용할 Groq 모델 목록을 반환합니다."""
-    raw_list = os.getenv("GROQ_MODELS", "").strip()
-    if raw_list:
-        models = [m.strip() for m in raw_list.split(",") if m.strip()]
-        if models:
-            return list(dict.fromkeys(models))
 
-    primary = (os.getenv("GROQ_MODEL") or "qwen/qwen3.8-27b").strip()
-    fallbacks_raw = os.getenv("GROQ_FALLBACK_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b").strip()
-    fallbacks = [m.strip() for m in fallbacks_raw.split(",") if m.strip()]
-    return list(dict.fromkeys([primary] + fallbacks))
-
-def _build_langchain_fallback_chain():
-    parser = JsonOutputParser()
-    prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            "당신은 뉴스 기사 및 기자 관점 분석기입니다. 반드시 유효한 JSON 객체만 출력하세요. "
-            "반드시 포함할 키: summary_facts (문자열), author_opinion (문자열), "
-            "stance_type ('긍정','부정','비판','중립' 중 1개), keywords (문자열 리스트, 최대 5개).",
-        ),
-        (
-            "human",
-            "제목: {title}\n"
-            "본문: {content}\n\n"
-            "요구사항:\n"
-            "1. summary_facts: 객관적인 핵심 사실 요약 (3문장 이내)\n"
-            "2. author_opinion: 기자의 주관적 평가, 전망, 분석, 비판 ('기자는 ~평가한다' 같은 설명투 대신 핵심 논조만 간결히, 없으면 빈 문자열)\n"
-            "3. stance_type: 긍정, 부정, 비판, 중립 중 하나\n"
-            "4. keywords: 핵심 키워드 리스트 (최대 5개)\n"
-            "{format_instructions}",
-        ),
-    ])
-
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    groq_max_tokens = int(os.getenv("GROQ_MAX_TOKENS", "700"))
-    use_ollama = os.getenv("USE_OLLAMA", "false").lower() == "true"
-
-    ollama_model_name = os.getenv("OLLAMA_MODEL", "gemma3:4b")
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-
-    chains = []
-    labels = []
-
-    if groq_api_key:
-        for model_name in _get_groq_model_queue():
-            groq_llm = ChatGroq(
-                model=model_name,
-                api_key=groq_api_key,
-                temperature=0.1,
-                max_tokens=groq_max_tokens,
-            )
-            groq_chain = (prompt | groq_llm | parser).with_config({"run_name": f"groq:{model_name}"})
-            chains.append(groq_chain)
-            labels.append(f"groq:{model_name}")
-
-    if use_ollama:
-        ollama_llm = ChatOllama(model=ollama_model_name, base_url=ollama_base_url, temperature=0.1)
-        ollama_chain = (prompt | ollama_llm | parser).with_config({"run_name": f"ollama:{ollama_model_name}"})
-        chains.append(ollama_chain)
-        labels.append(f"ollama:{ollama_model_name}")
-
-    if not chains:
-        raise RuntimeError("GROQ_API_KEY가 설정되어 있지 않고 USE_OLLAMA=false 상태입니다.")
-
-    primary = chains[0]
-    if len(chains) > 1:
-        primary = primary.with_fallbacks(chains[1:])
-
-    return primary, " -> ".join(labels), None
 
 def analyze_article_with_llm(title: str, raw_content: str, category: str = "뉴스") -> dict:
     default_res = _build_default_analysis(title, raw_content, category)
@@ -606,6 +542,7 @@ def analyze_article_with_llm(title: str, raw_content: str, category: str = "뉴�
 
     return default_res
 
+
 def _compose_raw_content(rss_description: str, scraped_content: str, fallback_title: str) -> str:
     desc = (rss_description or "").strip()
     body = (scraped_content or "").strip()
@@ -617,13 +554,25 @@ def _compose_raw_content(rss_description: str, scraped_content: str, fallback_ti
     return body or desc or fallback_title
 
 
-def _build_article_record(item: dict, scraped: dict, llm_result: dict, category: str, source_name: str, feed_url: str) -> dict:
+def _build_fallback_url(source_name: str, title: str, link: str) -> str:
+    digest = hashlib.sha256(f"{source_name}|{title}|{link}".encode("utf-8")).hexdigest()[:16]
+    return f"rss://{source_name}/{digest}"
+
+
+def _build_article_record(
+    item: dict,
+    scraped: dict,
+    llm_result: dict,
+    category: str,
+    source_name: str,
+    feed_url: str,
+) -> dict:
     title = item["title"]
     link = item["link"]
     rss_summary = item["description"]
     raw_content = _compose_raw_content(rss_summary, scraped.get("raw_content", ""), title)
     author_name = item["author"] or scraped.get("author") or "기자 미상"
-    final_url = scraped.get("final_url") or link or f"rss://{source_name}/{abs(hash(title))}"
+    final_url = scraped.get("final_url") or link or _build_fallback_url(source_name, title, link)
 
     return {
         "title": title,
@@ -651,103 +600,6 @@ def _build_article_record(item: dict, scraped: dict, llm_result: dict, category:
     }
 
 
-def crawl_rss(
-    rss_urls: Union[str, List[str]],
-    category: str = "종합",
-    source_name: str = "테스트언론사",
-    limit: Optional[int] = 3,
-    preview_chars: Optional[int] = 400,
-    sim_threshold: float = 0.82,
-) -> List[dict]:
-    """[테스트 전용 - DB 저장 안 함] 이전 기사들과의 내용 비교기 결과 및 기자 연계 여부를 출력합니다."""
-    urls = [rss_urls] if isinstance(rss_urls, str) else list(rss_urls)
-    collected_samples: List[dict] = []
-    seen_contents: List[tuple] = []
-
-    print("\n" + "=" * 70, file=sys.stderr)
-    print(f"🧪 [DRY-RUN 테스트 모드] DB 저장 없이 생데이터/비교기/가공결과 출력 ({source_name})", file=sys.stderr)
-    print("=" * 70, file=sys.stderr)
-
-    for feed_url in urls:
-        if not feed_url:
-            continue
-        print(f"\n📡 RSS XML 파싱 중: {feed_url}", file=sys.stderr)
-        items = parse_rss_items(feed_url)
-        target_items = items[:limit] if limit is not None else items
-        print(f"  └─ 전체 <item>: {len(items)}건 / 이번 테스트 대상: {len(target_items)}건", file=sys.stderr)
-
-        for idx, item in enumerate(target_items, start=1):
-            scraped = (
-                fetch_article_details(item["link"])
-                if item["link"]
-                else {"raw_content": "", "author": "", "thumbnail": "", "final_url": ""}
-            )
-            raw_content = _compose_raw_content(item["description"], scraped.get("raw_content", ""), item["title"])
-            llm_result = analyze_article_with_llm(item["title"], raw_content, category=category)
-            record = _build_article_record(item, scraped, llm_result, category, source_name, feed_url)
-
-            best_sim = 0.0
-            matched_idx = None
-            for prev_idx, prev_text in seen_contents:
-                sim = compute_text_similarity(raw_content, prev_text)
-                if sim > best_sim:
-                    best_sim = sim
-                    matched_idx = prev_idx
-
-            is_dup_content = (matched_idx is not None and best_sim >= sim_threshold)
-            if not is_dup_content:
-                seen_contents.append((idx, raw_content))
-
-            raw_preview = raw_content if preview_chars is None else raw_content[:preview_chars]
-            raw_payload = {
-                "rss_title": item["title"],
-                "rss_link": item["link"],
-                "final_url": record["url"],
-                "rss_pub_date": item["pub_date_raw"],
-                "parsed_published_at": record["published_at"].isoformat(),
-                "author_name": record["author_name"],
-                "thumbnail_url": record["thumbnail_url"],
-                "scraped_success": record["metadata"]["scraped_success"],
-                "content_hash": record["content_hash"],
-                "content_comparator": {
-                    "is_duplicate_content": is_dup_content,
-                    "best_similarity_score": round(best_sim, 4),
-                    "matched_article_index": matched_idx if is_dup_content else None,
-                    "db_action": "link_journalist_only_skip_content" if is_dup_content else "insert_new_content_and_journalist",
-                },
-                "raw_content_length": len(raw_content),
-                "raw_content_preview": raw_preview,
-            }
-            processed_payload = {
-                "category": record["category"],
-                "source": record["source"],
-                "model_version": record["model_version"],
-                "summary_facts": record["summary_facts"],
-                "author_opinion": record["author_opinion"],
-                "stance_type": record["stance_type"],
-                "keywords": record["keywords"],
-            }
-
-            print("\n" + "-" * 70, file=sys.stderr)
-            print(f"📰 [{idx}] {item['title']}", file=sys.stderr)
-            print("-" * 70, file=sys.stderr)
-            print("🔹 [1. REQUEST / XML / 스크래핑 생(RAW) 데이터]", file=sys.stderr)
-            print(json.dumps(raw_payload, ensure_ascii=False, indent=2), file=sys.stderr)
-            print("\n🔸 [2. LLM 가공(PROCESSED) 데이터]", file=sys.stderr)
-            print(json.dumps(processed_payload, ensure_ascii=False, indent=2), file=sys.stderr)
-
-            collected_samples.append({
-                "raw": raw_payload,
-                "processed": processed_payload,
-                "record": record,
-            })
-
-    print("\n" + "=" * 70, file=sys.stderr)
-    print(f"✅ [테스트 완료] 총 {len(collected_samples)}건 출력 (DB 미저장)", file=sys.stderr)
-    print("=" * 70, file=sys.stderr)
-    return collected_samples
-
-
 def crawl_and_save_rss(
     rss_urls: Union[str, List[str]],
     category: str,
@@ -759,7 +611,8 @@ def crawl_and_save_rss(
     """RSS URL들을 수집·분석하여 DB(postgres) 또는 파일(sqlite) 형태로 저장합니다."""
     mode = _resolve_storage_mode(storage_mode)
     urls = [rss_urls] if isinstance(rss_urls, str) else list(rss_urls)
-    total_count = 0
+    saved_count = 0
+    backup_count = 0
 
     for feed_url in urls:
         if not feed_url:
@@ -767,7 +620,7 @@ def crawl_and_save_rss(
         print(f"\n[{source_name}] RSS 수집 시작 ({mode}): {feed_url}", file=sys.stderr)
         all_items = parse_rss_items(feed_url)
         items = all_items[:limit] if (limit is not None and limit > 0) else all_items
-        print(f"  └─ 발견된 <item> 수: {len(all_items)}건 / 처리 대상: {len(items)}건", file=sys.stderr )
+        print(f"  └─ 발견된 <item> 수: {len(all_items)}건 / 처리 대상: {len(items)}건", file=sys.stderr)
 
         existing_urls = _fetch_existing_urls_by_mode(
             [it.get("link", "") for it in items],
@@ -803,16 +656,19 @@ def crawl_and_save_rss(
 
             try:
                 _persist_article_by_mode(article_data, mode=mode, sqlite_path=sqlite_path)
-                total_count += 1
+                saved_count += 1
             except Exception as e:
                 print(f"  [!] 저장 오류 발생, 백업 로그에 기록합니다: {e}", file=sys.stderr)
                 _append_backup_record(article_data)
-                total_count += 1
+                backup_count += 1
 
-    print(f"[{source_name}] ({mode}) 총 {total_count}건 처리 완료!",file=sys.stderr)
-    return total_count
+    print(
+        f"[{source_name}] ({mode}) 저장 완료: {saved_count}건 (백업 기록: {backup_count}건)",
+        file=sys.stderr,
+    )
+    return saved_count
 
-from typing import Callable, List, Optional, Union
+
 def crawl_multiple_rss_sources(
     sources_config: List[dict],
     limit: Optional[int] = None,
@@ -842,6 +698,7 @@ def crawl_multiple_rss_sources(
         )
     return grand_total
 
+
 def _append_backup_record(record: dict):
     try:
         backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backup")
@@ -855,5 +712,3 @@ def _append_backup_record(record: dict):
             f.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"  [!] 백업 파일 기록 실패: {e}", file=sys.stderr)
-
-

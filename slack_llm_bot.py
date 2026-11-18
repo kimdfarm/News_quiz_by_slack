@@ -38,7 +38,20 @@ for _p in (_BASE_DIR, _MCP_DIR):
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
-_SERVER_PATH = os.path.join(_MCP_DIR, "news_mcp_server.py")
+
+def _resolve_server_path() -> str:
+    candidates = [
+        os.path.join(_MCP_DIR, "news_mcp_server.py"),
+        os.path.join(_BASE_DIR, "news_mcp_server.py"),
+        os.path.join(os.path.dirname(_BASE_DIR), "mcp", "news_mcp_server.py"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+_SERVER_PATH = _resolve_server_path()
 _spec = importlib.util.spec_from_file_location("news_mcp_server", _SERVER_PATH)
 mcp_tools = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader
@@ -49,6 +62,7 @@ from crawler.news.plan_sources_from_request import (
     get_rss_crawling_guide,
     parse_help_topic,
 )
+from sqlite_store import init_sqlite_db
 from storage_backend import (
     DEFAULT_SQLITE_PATH,
     get_active_storage_backend,
@@ -56,7 +70,6 @@ from storage_backend import (
 
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
-# 추후 Tool RAG / 검색 인덱스로 확장할 때 그대로 재사용할 카탈로그
 TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
     "storage": [
         {
@@ -204,11 +217,6 @@ def _invoke_llm_with_fallback(
     max_tokens: int = 600,
     prefer_local: bool = False,
 ) -> Optional[str]:
-    """
-    LangChain 기반 상용(Groq) / 로컬(Ollama) 호출기.
-    - prefer_local=False: Groq 우선 시도 -> 실패 시 Ollama 모델 존재 여부 확인 후 폴백(없으면 미가동)
-    - prefer_local=True: Ollama 모델 존재 여부 확인 후 호출 -> 없으면 Groq 시도
-    """
     groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
     groq_models = list(
         dict.fromkeys(
@@ -444,7 +452,11 @@ def handle_mention(event, say, client):
         category = str(chosen.get("category") or "전체")
         limit = _normalize_positive_int(chosen.get("limit"), default=3) or 3
         say(text=f"📰 `{category}` 뉴스를 불러와 퀴즈를 만들고 있어요...")
-        raw_res = mcp_tools.get_recent_news_for_quiz(category=category, limit=limit)
+        raw_res = mcp_tools.get_recent_news_for_quiz(
+            category=category,
+            limit=limit,
+            sqlite_path=DEFAULT_SQLITE_PATH,
+        )
         bundle = json.loads(raw_res)
         articles = bundle.get("articles") or []
         news_context = (
@@ -610,10 +622,10 @@ if __name__ == "__main__":
     current_backend = get_active_storage_backend()
     if current_backend == "postgres" and os.getenv("DATABASE_URL"):
         from database import init_db
+
         init_db()
     elif current_backend == "sqlite":
-        from crawler.sqlite_store import init_sqlite_db
-        init_sqlite_db()
+        init_sqlite_db(DEFAULT_SQLITE_PATH)
 
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()

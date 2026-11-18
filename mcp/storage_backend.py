@@ -1,8 +1,11 @@
 import json
 import os
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from psycopg2.extras import Json
 
 from database import clean_old_news, get_db_connection
 
@@ -63,6 +66,48 @@ def set_active_storage_backend(backend: str) -> str:
     return normalized
 
 
+def _parse_keywords_list(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        return [str(k).strip() for k in raw if str(k).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(k).strip() for k in parsed if str(k).strip()]
+        except Exception:
+            pass
+        return [raw.strip()]
+    return []
+
+
+def _parse_json_obj(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def _parse_timestamp(raw: Any) -> Optional[datetime]:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=None) if raw.tzinfo else raw
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception:
+        return None
+
+
 def _query_postgres_news(category: str, limit: int, days: int = 7) -> List[Dict[str, Any]]:
     clean_old_news()
     cutoff = datetime.now() - timedelta(days=days)
@@ -73,7 +118,7 @@ def _query_postgres_news(category: str, limit: int, days: int = 7) -> List[Dict[
         cur.execute(
             """
             SELECT p.title, p.summary_facts, p.author_opinion, p.stance_type,
-                   i.keywords_json, s.name AS source_name, p.published_at
+                   i.keywords, s.name AS source_name, p.published_at
             FROM news_perspectives p
             LEFT JOIN news_issues i ON i.id = p.issue_id
             LEFT JOIN categories c ON c.id = i.category_id
@@ -89,25 +134,14 @@ def _query_postgres_news(category: str, limit: int, days: int = 7) -> List[Dict[
         rows = cur.fetchall()
         results = []
         for r in rows:
-            kw_raw = r[4]
-            if isinstance(kw_raw, list):
-                keywords = kw_raw
-            elif isinstance(kw_raw, str) and kw_raw.strip():
-                try:
-                    keywords = json.loads(kw_raw)
-                except Exception:
-                    keywords = [kw_raw]
-            else:
-                keywords = []
-
             results.append({
                 "title": r[0],
                 "facts": r[1] or "",
                 "opinion": r[2] or "",
                 "stance_type": r[3] or "중립",
-                "keywords": keywords,
+                "keywords": _parse_keywords_list(r[4]),
                 "source": r[5] or "",
-                "published_at": str(r[6]) if r[6] else "",
+                "published_at": r[6].isoformat() if isinstance(r[6], datetime) else (str(r[6]) if r[6] else ""),
             })
         return results
     finally:
@@ -133,7 +167,7 @@ def _query_sqlite_news(
         cur.execute(
             """
             SELECT p.title, p.summary_facts, p.author_opinion, p.stance_type,
-                   i.keywords_json, s.name AS source_name, p.published_at
+                   i.keywords, s.name AS source_name, p.published_at
             FROM news_perspectives p
             LEFT JOIN news_issues i ON i.id = p.issue_id
             LEFT JOIN categories c ON c.id = i.category_id
@@ -149,16 +183,12 @@ def _query_sqlite_news(
         rows = cur.fetchall()
         results = []
         for r in rows:
-            try:
-                keywords = json.loads(r["keywords_json"] or "[]")
-            except Exception:
-                keywords = []
             results.append({
                 "title": r["title"],
                 "facts": r["summary_facts"] or "",
                 "opinion": r["author_opinion"] or "",
                 "stance_type": r["stance_type"] or "중립",
-                "keywords": keywords,
+                "keywords": _parse_keywords_list(r["keywords_json"]),
                 "source": r["source_name"] or "",
                 "published_at": r["published_at"] or "",
             })
@@ -192,12 +222,6 @@ def fetch_recent_news(
         "count": len(articles),
         "articles": articles,
     }
-
-
-
-
-
-import sqlite3
 
 
 def _resolve_sqlite_path(sqlite_path: Optional[str] = None) -> str:
@@ -256,7 +280,7 @@ def _ensure_sqlite_tables(conn: sqlite3.Connection) -> None:
                 thumbnail_url TEXT,
                 processing_status TEXT DEFAULT 'COMPLETED',
                 model_version TEXT,
-                metadata_json TEXT,
+                metadata TEXT,
                 published_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -297,6 +321,7 @@ def _get_or_create_sqlite_issue(
         if existing:
             return int(existing[0])
 
+    keywords_json = json.dumps(issue_row.get("keywords") or [], ensure_ascii=False)
     cur.execute(
         """
         INSERT INTO news_issues (
@@ -308,7 +333,7 @@ def _get_or_create_sqlite_issue(
             issue_row.get("issue_title") or "",
             issue_row.get("representative_summary"),
             category_id,
-            issue_row.get("keywords_json"),
+            keywords_json,
             issue_hash,
             issue_row.get("published_at"),
             issue_row.get("created_at"),
@@ -360,23 +385,24 @@ def _get_or_create_pg_issue(
         if existing:
             return int(existing[0])
 
+    keywords = _parse_keywords_list(issue_row.get("keywords"))
     cur.execute(
         """
         INSERT INTO news_issues (
-            issue_title, representative_summary, category_id, keywords_json,
+            issue_title, representative_summary, category_id, keywords,
             issue_hash, published_at, created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, CURRENT_TIMESTAMP), COALESCE(%s, CURRENT_TIMESTAMP))
         RETURNING id;
         """,
         (
             issue_row.get("issue_title") or "",
             issue_row.get("representative_summary"),
             category_id,
-            issue_row.get("keywords_json"),
+            keywords,
             issue_hash,
-            issue_row.get("published_at"),
-            issue_row.get("created_at"),
-            issue_row.get("updated_at"),
+            _parse_timestamp(issue_row.get("published_at")),
+            _parse_timestamp(issue_row.get("created_at")),
+            _parse_timestamp(issue_row.get("updated_at")),
         ),
     )
     row = cur.fetchone()
@@ -406,8 +432,6 @@ def sync_sqlite_to_postgres(
             "message": "DATABASE_URL 환경변수가 설정되지 않았어요.",
         }
 
-    from database import get_db_connection
-
     sq_conn = sqlite3.connect(db_file)
     sq_conn.row_factory = sqlite3.Row
     sq_cur = sq_conn.cursor()
@@ -416,14 +440,13 @@ def sync_sqlite_to_postgres(
     pg_cur = pg_conn.cursor()
 
     try:
-        # 소스/이슈/카테고리 정보 포함하여 기사 조회
         sql = """
             SELECT
                 p.*,
                 s.name AS source_name,
                 i.issue_title,
                 i.representative_summary,
-                i.keywords_json,
+                i.keywords,
                 i.issue_hash,
                 i.published_at AS issue_published_at,
                 i.created_at AS issue_created_at,
@@ -464,7 +487,7 @@ def sync_sqlite_to_postgres(
                 {
                     "issue_title": r.get("issue_title"),
                     "representative_summary": r.get("representative_summary"),
-                    "keywords_json": r.get("keywords_json"),
+                    "keywords": _parse_keywords_list(r.get("keywords_json")),
                     "issue_hash": r.get("issue_hash"),
                     "published_at": r.get("issue_published_at"),
                     "created_at": r.get("issue_created_at"),
@@ -474,6 +497,7 @@ def sync_sqlite_to_postgres(
                 else None
             )
             issue_id = _get_or_create_pg_issue(pg_cur, issue_data, cat_id)
+            meta_obj = _parse_json_obj(r.get("metadata"))
 
             pg_cur.execute(
                 """
@@ -481,12 +505,12 @@ def sync_sqlite_to_postgres(
                     issue_id, source_id, title, author_name, url,
                     summary_facts, author_opinion, stance_type, raw_content,
                     content_hash, thumbnail_url, processing_status,
-                    model_version, metadata_json, published_at, created_at
+                    model_version, metadata, published_at, created_at
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s,
-                    %s, %s, %s, %s
+                    %s, %s, %s, COALESCE(%s, CURRENT_TIMESTAMP)
                 )
                 ON CONFLICT (url) DO NOTHING;
                 """,
@@ -504,9 +528,9 @@ def sync_sqlite_to_postgres(
                     r.get("thumbnail_url"),
                     r.get("processing_status") or "COMPLETED",
                     r.get("model_version"),
-                    r.get("metadata_json"),
-                    r.get("published_at"),
-                    r.get("created_at"),
+                    Json(meta_obj),
+                    _parse_timestamp(r.get("published_at")),
+                    _parse_timestamp(r.get("created_at")),
                 ),
             )
             if pg_cur.rowcount and pg_cur.rowcount > 0:
@@ -553,8 +577,6 @@ def sync_postgres_to_sqlite(
             "message": "DATABASE_URL 환경변수가 설정되지 않았어요.",
         }
 
-    from database import get_db_connection
-
     os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
     sq_conn = sqlite3.connect(db_file)
     _ensure_sqlite_tables(sq_conn)
@@ -579,23 +601,23 @@ def sync_postgres_to_sqlite(
                 p.thumbnail_url,
                 p.processing_status,
                 p.model_version,
-                p.metadata_json,
-                p.published_at::text,
-                p.created_at::text,
+                p.metadata,
+                p.published_at,
+                p.created_at,
                 s.name AS source_name,
                 i.issue_title,
                 i.representative_summary,
-                i.keywords_json::text,
+                i.keywords,
                 i.issue_hash,
-                i.published_at::text AS issue_published_at,
-                i.created_at::text AS issue_created_at,
-                i.updated_at::text AS issue_updated_at,
+                i.published_at AS issue_published_at,
+                i.created_at AS issue_created_at,
+                i.updated_at AS issue_updated_at,
                 c.name AS category_name
             FROM news_perspectives p
             LEFT JOIN sources s ON p.source_id = s.id
             LEFT JOIN news_issues i ON p.issue_id = i.id
             LEFT JOIN categories c ON i.category_id = c.id
-            ORDER BY COALESCE(p.published_at::text, p.created_at::text) DESC, p.id DESC
+            ORDER BY COALESCE(p.published_at, p.created_at) DESC, p.id DESC
         """
         params: List[Any] = []
         if limit is not None and int(limit) > 0:
@@ -627,16 +649,19 @@ def sync_postgres_to_sqlite(
                 {
                     "issue_title": r.get("issue_title"),
                     "representative_summary": r.get("representative_summary"),
-                    "keywords_json": r.get("keywords_json"),
+                    "keywords": _parse_keywords_list(r.get("keywords")),
                     "issue_hash": r.get("issue_hash"),
-                    "published_at": r.get("issue_published_at"),
-                    "created_at": r.get("issue_created_at"),
-                    "updated_at": r.get("issue_updated_at"),
+                    "published_at": r.get("issue_published_at").isoformat() if isinstance(r.get("issue_published_at"), datetime) else r.get("issue_published_at"),
+                    "created_at": r.get("issue_created_at").isoformat() if isinstance(r.get("issue_created_at"), datetime) else r.get("issue_created_at"),
+                    "updated_at": r.get("issue_updated_at").isoformat() if isinstance(r.get("issue_updated_at"), datetime) else r.get("issue_updated_at"),
                 }
                 if r.get("issue_title") or r.get("issue_hash")
                 else None
             )
             issue_id = _get_or_create_sqlite_issue(sq_cur, issue_data, cat_id)
+            meta_json = json.dumps(_parse_json_obj(r.get("metadata")), ensure_ascii=False)
+            pub_val = r.get("published_at")
+            crt_val = r.get("created_at")
 
             sq_cur.execute(
                 """
@@ -644,7 +669,7 @@ def sync_postgres_to_sqlite(
                     issue_id, source_id, title, author_name, url,
                     summary_facts, author_opinion, stance_type, raw_content,
                     content_hash, thumbnail_url, processing_status,
-                    model_version, metadata_json, published_at, created_at
+                    model_version, metadata, published_at, created_at
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
@@ -666,9 +691,9 @@ def sync_postgres_to_sqlite(
                     r.get("thumbnail_url"),
                     r.get("processing_status") or "COMPLETED",
                     r.get("model_version"),
-                    r.get("metadata_json"),
-                    r.get("published_at"),
-                    r.get("created_at"),
+                    meta_json,
+                    pub_val.isoformat() if isinstance(pub_val, datetime) else pub_val,
+                    crt_val.isoformat() if isinstance(crt_val, datetime) else crt_val,
                 ),
             )
             if sq_cur.rowcount and sq_cur.rowcount > 0:
