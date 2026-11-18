@@ -52,41 +52,80 @@ from crawler.news.plan_sources_from_request import (
 from storage_backend import (
     DEFAULT_SQLITE_PATH,
     get_active_storage_backend,
-    normalize_storage_backend,
 )
 
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
-MCP_TOOL_CATALOG = [
-    {
-        "tool": "run_rss_by_request",
-        "description": "자연어 요청을 해석해 RSS 뉴스를 크롤링/수집한다. (예: 국제 뉴스 3개 모아줘, 연합/경제 수집)",
-    },
-    {
-        "tool": "set_storage_backend",
-        "description": "저장소 백엔드를 postgres(네온db/DB) 또는 sqlite(로컬/파일)로 변경한다.",
-    },
-    {
-        "tool": "export_sqlite_file",
-        "description": "SQLite DB 파일(news_store.sqlite)을 Slack으로 추출/다운로드할 수 있게 업로드한다.",
-    },
-    {
-        "tool": "get_recent_news_for_quiz",
-        "description": "저장된 최근 뉴스를 조회해 시사 퀴즈를 만든다.",
-    },
-    {
-        "tool": "get_storage_status",
-        "description": "현재 저장소 설정과 SQLite / Postgres 연결·파일 상태를 조회한다.",
-    },
-    {
-        "tool": "get_storage_stats",
-        "description": "현재 또는 지정 저장소(sqlite / postgres)의 기사 수 및 언론사/분야별 통계를 조회한다.",
-    },
-    {
-        "tool": "none",
-        "description": "위 도구 목록에 없는 기능이나 무관한 요청이면 반드시 선택한다.",
-    },
-]
+# 추후 Tool RAG / 검색 인덱스로 확장할 때 그대로 재사용할 카탈로그
+TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
+    "storage": [
+        {
+            "tool": "set_storage_backend",
+            "description": (
+                "저장소 백엔드 모드(sqlite 파일 vs postgres/neon db)를 변경한다. "
+                "예: '네온db로 변경해줘', 'sqlite로 바꿔줘', '저장 상태를 파일 형태로 바꿔줘'"
+            ),
+        },
+        {
+            "tool": "export_sqlite_file",
+            "description": (
+                "로컬 SQLite DB 파일(news_store.sqlite) 자체를 Slack으로 추출/다운로드한다. "
+                "예: 'sqlite 파일 추출해줘', 'news_store.sqlite 다운로드', 'sqlite 파일 보내줘'"
+            ),
+        },
+        {
+            "tool": "get_storage_status",
+            "description": (
+                "현재 활성 저장소 모드와 SQLite / Postgres 연결·파일 상태를 조회한다. "
+                "예: '저장소 상태 확인해줘', 'DB 연결 상태 보고해줘', '현재 어디에 저장 중이지?'"
+            ),
+        },
+        {
+            "tool": "get_storage_stats",
+            "description": (
+                "저장소(sqlite 또는 postgres)의 기사 수, 언론사별·분야별·기간 통계를 조회한다. "
+                "예: '저장된 정보 통계 보여줘', '몇 건 쌓였어?', '통계 알려줘'"
+            ),
+        },
+        {
+            "tool": "sync_sqlite_to_postgres",
+            "description": (
+                "[단방향: SQLite 파일 -> Neon DB(PostgreSQL)] 로컬 파일 데이터를 디지털 DB(Neon/Postgres)로 올린다. "
+                "예: 'sqlite를 postgres로 동기화해줘', '로컬 데이터 네온으로 올려줘', '파일 데이터 디지털 DB로 동기화'"
+            ),
+        },
+        {
+            "tool": "sync_postgres_to_sqlite",
+            "description": (
+                "[단방향: Neon DB(PostgreSQL) -> SQLite 파일] 디지털 DB(Neon/Postgres) 데이터를 로컬 파일로 내려받는다. "
+                "예: 'postgres를 sqlite로 동기화해줘', '네온 db 데이터를 로컬 파일로 가져와줘', '디지털 DB 데이터를 파일로 동기화'"
+            ),
+        },
+    ],
+    "content": [
+        {
+            "tool": "run_rss_by_request",
+            "description": (
+                "자연어 요청을 해석해 RSS 뉴스를 크롤링/수집한다. "
+                "예: '국제 뉴스 3개 모아줘', '연합/경제 수집'"
+            ),
+        },
+        {
+            "tool": "get_recent_news_for_quiz",
+            "description": (
+                "저장된 최근 뉴스를 바탕으로 시사 퀴즈를 생성한다. "
+                "예: '경제 뉴스로 퀴즈 내줘', '최근 뉴스 문제 만들어줘'"
+            ),
+        },
+    ],
+}
+
+VALID_TOOLS = {
+    item["tool"]
+    for tools in TOOL_GROUPS.values()
+    for item in tools
+} | {"none"}
+
 
 def _clean_mention_text(text: str) -> str:
     return re.sub(r"<@[A-Z0-9_]+>", "", text or "").strip()
@@ -108,6 +147,36 @@ def _extract_json(raw_text: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 return None
         return None
+
+
+def _normalize_backend_value(raw_val: Any) -> Optional[str]:
+    """LLM이 반환한 저장소 명칭을 'sqlite' 또는 'postgres'로 정규화(불명확 시 None)."""
+    if raw_val is None:
+        return None
+    val = str(raw_val).strip().lower()
+    if not val or val in ("null", "none", "auto", "default", "미지정"):
+        return None
+    if val in ("sqlite", "file", "local", "로컬", "파일"):
+        return "sqlite"
+    if val in ("postgres", "postgresql", "neon", "네온", "네온db", "db", "디비", "디지털 db"):
+        return "postgres"
+    return None
+
+
+def _normalize_positive_int(raw_val: Any, default: Optional[int] = None) -> Optional[int]:
+    """LLM이 추출한 limit/정수 값을 안전하게 양의 정수로 변환."""
+    if raw_val is None or isinstance(raw_val, bool):
+        return default
+    if isinstance(raw_val, int):
+        return raw_val if raw_val > 0 else None
+    if isinstance(raw_val, str):
+        cleaned = raw_val.strip()
+        if not cleaned or cleaned.lower() in ("null", "none", "all", "전체", "모두", "다"):
+            return None
+        if cleaned.isdigit():
+            num = int(cleaned)
+            return num if num > 0 else None
+    return default
 
 
 def _is_ollama_model_available(model_name: str, base_url: str, timeout: float = 1.5) -> bool:
@@ -202,44 +271,69 @@ def _invoke_llm_with_fallback(
     return _run_ollama()
 
 
-def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
-    system_prompt = (
-        "당신은 Slack 봇의 MCP 도구 선택기입니다. 사용자 요청을 보고 아래 도구 중 하나만 고르세요.\n"
-        f"{json.dumps(MCP_TOOL_CATALOG, ensure_ascii=False, indent=2)}\n\n"
-        "설명/잡담/마크다운 없이 순수 JSON 객체 1개만 출력하세요:\n"
-        '{"tool": "run_rss_by_request | set_storage_backend | export_sqlite_file | get_recent_news_for_quiz | get_storage_status | none", '
-        '"storage_backend": "sqlite | postgres | null", "category": "전체", "limit": 5}\n'
-        "규칙:\n"
-        "- 저장소/DB/데이터 저장 위치·모드 변경 요청(예: '네온db로 변경해줘', 'sqlite로 바꿔줘', '저장 상태를 파일 형태로 바꿔줘', '로컬 파일로 저장해줘', '디비로 변경') -> set_storage_backend\n"
-        "  * sqlite/로컬/파일 저장 모드 전환 -> storage_backend: \"sqlite\"\n"
-        "  * postgres/neon/네온db/db/디비 저장 모드 전환 -> storage_backend: \"postgres\"\n"
-        "- 저장된 sqlite 파일 자체를 다운로드/추출/내보내기/보내줘 요청(예: 'sqlite 파일 추출해줘', 'news_store.sqlite 다운로드', 'sqlite 파일 보내줘') -> export_sqlite_file\n"
-        "- RSS 수집/크롤링/기사 모아줘/기사 수집해줘 요청 -> run_rss_by_request\n"
-        "- 퀴즈/문제 출제 요청 -> get_recent_news_for_quiz\n"
-        "- 저장소 상태/DB 상태/SQLite 상태/연결 상태 조회 요청(예: '저장소 상태 확인해줘', 'DB 연결 상태 보고해줘', '현재 어디에 저장 중이지?') -> get_storage_status\n"
-        "- 저장소 통계/기사 건수/언론사별·분야별 현황 조회 요청(예: '저장된 정보 통계 보여줘', '몇 건 쌓였어?', '통계 알려줘', '기사 수 확인해줘') -> get_storage_stats"
-        "- 그 외 모든 요청 -> none"
+def _route_tool_group(user_text: str) -> str:
+    """1단계 라우터: 요청이 속하는 기능 그룹만 LLM으로 분류."""
+    router_prompt = (
+        "사용자 요청이 속하는 기능 그룹 하나만 문맥으로 판별하세요.\n"
+        "- storage: 저장소 모드 변경, 상태/통계 조회, sqlite 파일 추출, 저장소 간 데이터 동기화\n"
+        "- content: RSS 뉴스 수집/크롤링, 저장된 뉴스 기반 시사 퀴즈 생성\n"
+        "- none: 위 그룹에 해당하지 않는 요청\n\n"
+        '설명 없이 순수 JSON 1개만 출력하세요: {"group": "storage | content | none"}'
     )
+    raw = _invoke_llm_with_fallback(
+        messages=[SystemMessage(content=router_prompt), HumanMessage(content=user_text)],
+        temperature=0.0,
+        max_tokens=120,
+        prefer_local=False,
+    )
+    parsed = _extract_json(raw or "") or {}
+    group = str(parsed.get("group") or "none").strip().lower()
+    print(f"[DEBUG] text={user_text!r} -> parsed={parsed}", file=sys.stderr)
+    return group if group in ("storage", "content", "none") else "none"
 
-    valid_tools = {
-        "run_rss_by_request",
-        "set_storage_backend",
-        "export_sqlite_file",
-        "get_recent_news_for_quiz",
-        "get_storage_status",
-        "get_storage_stats",
-        "none",
-    }
+
+def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
+    """2단계 선택기: 라우터가 고른 그룹의 도구 목록을 바탕으로 도구와 파라미터를 LLM이 직접 해석."""
+    group = _route_tool_group(user_text)
+    if group == "none":
+        return {"tool": "none"}
+
+    candidates = TOOL_GROUPS[group]
+    if group == "storage":
+        system_prompt = (
+            "당신은 저장소 및 동기화 MCP 도구 선택기입니다. 사용자 발화의 의도, 출발지/목적지 방향, "
+            "대상 저장소, 건수 제한(limit)을 문맥으로 파악해 순수 JSON 1개만 출력하세요.\n"
+            f"{json.dumps(candidates, ensure_ascii=False, indent=2)}\n\n"
+            "판별 기준:\n"
+            "- 출발지가 로컬/파일/SQLite이고 목적지가 Neon/Postgres/디지털 DB/DB인 동기화 -> sync_sqlite_to_postgres\n"
+            "- 출발지가 Neon/Postgres/디지털 DB/DB이고 목적지가 로컬/파일/SQLite인 동기화 -> sync_postgres_to_sqlite\n"
+            "- 저장소 모드/백엔드 자체를 변경 -> set_storage_backend (storage_backend에 'sqlite' 또는 'postgres')\n"
+            "- SQLite 파일 자체를 내보내기/다운로드 -> export_sqlite_file\n"
+            "- 현재 저장소 설정/연결/파일 상태 확인 -> get_storage_status\n"
+            "- 기사 건수/언론사/분야/기간 통계 조회 -> get_storage_stats (특정 저장소가 언급되면 target_backend에 'sqlite' 또는 'postgres', 없으면 null)\n"
+            "- 해당 없음 -> none\n\n"
+            "limit 규칙:\n"
+            "- 특정 건수/개수 제한이 언급되면 양의 정수로 넣고, 전체/모두/다 또는 건수 제한 언급이 없으면 null을 넣으세요.\n\n"
+            '출력 형식: {"tool": "...", "storage_backend": null, "target_backend": null, "limit": null}'
+        )
+    else:
+        system_prompt = (
+            "당신은 뉴스 수집 및 퀴즈 MCP 도구 선택기입니다. 사용자 발화를 문맥으로 파악해 "
+            "순수 JSON 1개만 출력하세요.\n"
+            f"{json.dumps(candidates, ensure_ascii=False, indent=2)}\n\n"
+            '출력 형식: {"tool": "run_rss_by_request | get_recent_news_for_quiz | none", "category": "전체", "limit": 3}'
+        )
 
     raw = _invoke_llm_with_fallback(
         messages=[SystemMessage(content=system_prompt), HumanMessage(content=user_text)],
         temperature=0.0,
-        max_tokens=600,
+        max_tokens=300,
         prefer_local=False,
     )
     parsed = _extract_json(raw or "")
-    if parsed and parsed.get("tool") in valid_tools:
+    if parsed and parsed.get("tool") in VALID_TOOLS:
         return parsed
+    print(f"[DEBUG] text={user_text!r} -> parsed={parsed}", file=sys.stderr)
     return {"tool": "none"}
 
 
@@ -254,8 +348,22 @@ def ask_llm_for_quiz(prompt: str) -> str:
     return out or "사용 가능한 LLM 모델이 없어 퀴즈를 생성하지 못했습니다."
 
 
+def _format_sync_result(data: dict, direction_label: str) -> str:
+    if data.get("status") != "ok":
+        return f"⚠️ 동기화 실패 ({direction_label}): {data.get('message', '알 수 없는 오류')}"
+
+    limit_val = data.get("limit")
+    limit_text = f"최근 {limit_val}건" if limit_val else "전체"
+    return (
+        f"🔄 *동기화 완료* ({direction_label})\n"
+        f"• 대상 범위: {limit_text} (조회 {data.get('fetched_count', 0)}건)\n"
+        f"• 신규 반영: *{data.get('inserted_count', 0)}건*\n"
+        f"• 중복 건너뜀: {data.get('skipped_count', 0)}건"
+    )
+
+
 @app.event("app_mention")
-def handle_mention(event, say,client):
+def handle_mention(event, say, client):
     if is_crawling():
         say(text="현재 다른 사용자가 뉴스를 수집하고 있어요. 잠시 후 다시 시도해 주세요.")
         return
@@ -278,24 +386,17 @@ def handle_mention(event, say,client):
         return
 
     if tool == "set_storage_backend":
-        raw_backend = str(chosen.get("storage_backend") or "").strip().lower()
-        if raw_backend in ("sqlite", "file", "local", "로컬", "파일"):
-            target_mode = "sqlite"
-        elif raw_backend in ("postgres", "postgresql", "db", "디비", "neon", "네온", "네온db"):
-            target_mode = "postgres"
-        else:
-            lowered = user_text.lower()
+        target_mode = _normalize_backend_value(chosen.get("storage_backend"))
+        if not target_mode:
             target_mode = (
-                "sqlite"
-                if any(k in lowered for k in ("sqlite", "로컬", "파일"))
-                else "postgres"
+                "postgres" if get_active_storage_backend() == "sqlite" else "sqlite"
             )
         raw_res = mcp_tools.set_storage_backend(target_mode)
         data = json.loads(raw_res)
         say(text=f"✅ 저장소 백엔드를 `{data.get('STORAGE_BACKEND')}`로 변경했어요.")
         return
 
-    if tool == "run_rss_by_request":    
+    if tool == "run_rss_by_request":
         if is_crawling():
             return
 
@@ -338,9 +439,10 @@ def handle_mention(event, say,client):
             )
         )
         return
+
     if tool == "get_recent_news_for_quiz":
         category = str(chosen.get("category") or "전체")
-        limit = int(chosen.get("limit") or 3)
+        limit = _normalize_positive_int(chosen.get("limit"), default=3) or 3
         say(text=f"📰 `{category}` 뉴스를 불러와 퀴즈를 만들고 있어요...")
         raw_res = mcp_tools.get_recent_news_for_quiz(category=category, limit=limit)
         bundle = json.loads(raw_res)
@@ -418,15 +520,7 @@ def handle_mention(event, say,client):
         return
 
     if tool == "get_storage_stats":
-        lowered = user_text.lower()
-        if any(k in lowered for k in ("sqlite", "로컬", "파일")) and not any(
-            k in lowered for k in ("postgres", "neon", "네온", "db", "디비")
-        ):
-            target_backend = "sqlite"
-        elif any(k in lowered for k in ("postgres", "neon", "네온", "db", "디비")):
-            target_backend = "postgres"
-        else:
-            target_backend = None
+        target_backend = _normalize_backend_value(chosen.get("target_backend"))
 
         raw_res = mcp_tools.get_storage_stats(
             target_backend=target_backend,
@@ -489,6 +583,25 @@ def handle_mention(event, say,client):
         )
         return
 
+    if tool == "sync_sqlite_to_postgres":
+        sync_limit = _normalize_positive_int(chosen.get("limit"), default=None)
+        raw_res = mcp_tools.sync_sqlite_to_postgres(
+            limit=sync_limit,
+            sqlite_path=DEFAULT_SQLITE_PATH,
+        )
+        data = json.loads(raw_res)
+        say(text=_format_sync_result(data, "SQLite → Neon DB"))
+        return
+
+    if tool == "sync_postgres_to_sqlite":
+        sync_limit = _normalize_positive_int(chosen.get("limit"), default=None)
+        raw_res = mcp_tools.sync_postgres_to_sqlite(
+            limit=sync_limit,
+            sqlite_path=DEFAULT_SQLITE_PATH,
+        )
+        data = json.loads(raw_res)
+        say(text=_format_sync_result(data, "Neon DB → SQLite"))
+        return
 
     say(text="그런 기능은 없어요.")
 

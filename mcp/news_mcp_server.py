@@ -398,6 +398,39 @@ def get_storage_stats(
             ensure_ascii=False,
         )
 
+@mcp.tool()
+def sync_sqlite_to_postgres(
+    limit: Optional[int] = None,
+    sqlite_path: Optional[str] = None,
+) -> str:
+    """로컬 SQLite(news_store.sqlite)의 기사를 Neon DB(PostgreSQL)로 동기화합니다.
+    limit을 지정하면 최근 N건만, 지정하지 않으면 전체를 대상으로 하며 중복 URL은 건너뜁니다.
+    """
+    from storage_backend import sync_sqlite_to_postgres as _sync_sq_to_pg
+
+    result = _sync_sq_to_pg(limit=limit, sqlite_path=sqlite_path)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def sync_postgres_to_sqlite(
+    limit: Optional[int] = None,
+    sqlite_path: Optional[str] = None,
+) -> str:
+    """Neon DB(PostgreSQL)의 기사를 로컬 SQLite(news_store.sqlite)로 동기화합니다.
+    limit을 지정하면 최근 N건만, 지정하지 않으면 전체를 대상으로 하며 중복 URL은 건너뜁니다.
+    """
+    from storage_backend import sync_postgres_to_sqlite as _sync_pg_to_sq
+
+    result = _sync_pg_to_sq(limit=limit, sqlite_path=sqlite_path)
+    return json.dumps(result, ensure_ascii=False)
+
+
+
+
+
+
+
 
 
 if __name__ == "__main__":

@@ -192,3 +192,510 @@ def fetch_recent_news(
         "count": len(articles),
         "articles": articles,
     }
+
+
+
+
+
+import sqlite3
+
+
+def _resolve_sqlite_path(sqlite_path: Optional[str] = None) -> str:
+    raw = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or DEFAULT_SQLITE_PATH).strip()
+    return os.path.abspath(raw)
+
+
+def _ensure_sqlite_tables(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_issues (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_title TEXT NOT NULL,
+                representative_summary TEXT,
+                category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+                keywords_json TEXT,
+                issue_hash TEXT UNIQUE,
+                published_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_perspectives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER REFERENCES news_issues(id) ON DELETE CASCADE,
+                source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                author_name TEXT,
+                url TEXT UNIQUE NOT NULL,
+                summary_facts TEXT,
+                author_opinion TEXT,
+                stance_type TEXT DEFAULT '중립',
+                raw_content TEXT,
+                content_hash TEXT,
+                thumbnail_url TEXT,
+                processing_status TEXT DEFAULT 'COMPLETED',
+                model_version TEXT,
+                metadata_json TEXT,
+                published_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        cur.close()
+
+
+def _get_or_create_sqlite_category(cur: sqlite3.Cursor, name: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    cur.execute("INSERT OR IGNORE INTO categories (name) VALUES (?);", (name,))
+    cur.execute("SELECT id FROM categories WHERE name = ?;", (name,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _get_or_create_sqlite_source(cur: sqlite3.Cursor, name: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    cur.execute("INSERT OR IGNORE INTO sources (name) VALUES (?);", (name,))
+    cur.execute("SELECT id FROM sources WHERE name = ?;", (name,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _get_or_create_sqlite_issue(
+    cur: sqlite3.Cursor, issue_row: Optional[Dict[str, Any]], category_id: Optional[int]
+) -> Optional[int]:
+    if not issue_row:
+        return None
+    issue_hash = issue_row.get("issue_hash")
+    if issue_hash:
+        cur.execute("SELECT id FROM news_issues WHERE issue_hash = ?;", (issue_hash,))
+        existing = cur.fetchone()
+        if existing:
+            return int(existing[0])
+
+    cur.execute(
+        """
+        INSERT INTO news_issues (
+            issue_title, representative_summary, category_id, keywords_json,
+            issue_hash, published_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            issue_row.get("issue_title") or "",
+            issue_row.get("representative_summary"),
+            category_id,
+            issue_row.get("keywords_json"),
+            issue_hash,
+            issue_row.get("published_at"),
+            issue_row.get("created_at"),
+            issue_row.get("updated_at"),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def _get_or_create_pg_category(cur: Any, name: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    cur.execute(
+        """
+        INSERT INTO categories (name) VALUES (%s)
+        ON CONFLICT (name) DO NOTHING;
+        """,
+        (name,),
+    )
+    cur.execute("SELECT id FROM categories WHERE name = %s;", (name,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _get_or_create_pg_source(cur: Any, name: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    cur.execute(
+        """
+        INSERT INTO sources (name) VALUES (%s)
+        ON CONFLICT (name) DO NOTHING;
+        """,
+        (name,),
+    )
+    cur.execute("SELECT id FROM sources WHERE name = %s;", (name,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _get_or_create_pg_issue(
+    cur: Any, issue_row: Optional[Dict[str, Any]], category_id: Optional[int]
+) -> Optional[int]:
+    if not issue_row:
+        return None
+    issue_hash = issue_row.get("issue_hash")
+    if issue_hash:
+        cur.execute("SELECT id FROM news_issues WHERE issue_hash = %s;", (issue_hash,))
+        existing = cur.fetchone()
+        if existing:
+            return int(existing[0])
+
+    cur.execute(
+        """
+        INSERT INTO news_issues (
+            issue_title, representative_summary, category_id, keywords_json,
+            issue_hash, published_at, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+        """,
+        (
+            issue_row.get("issue_title") or "",
+            issue_row.get("representative_summary"),
+            category_id,
+            issue_row.get("keywords_json"),
+            issue_hash,
+            issue_row.get("published_at"),
+            issue_row.get("created_at"),
+            issue_row.get("updated_at"),
+        ),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def sync_sqlite_to_postgres(
+    limit: Optional[int] = None,
+    sqlite_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """로컬 SQLite -> Neon DB(PostgreSQL) 단방향 동기화 (중복 스킵, 원본 유지)."""
+    db_file = _resolve_sqlite_path(sqlite_path)
+    if not os.path.isfile(db_file):
+        return {
+            "status": "unavailable",
+            "direction": "sqlite_to_postgres",
+            "limit": limit,
+            "message": f"SQLite 파일이 없어요: {db_file}",
+        }
+
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    if not db_url:
+        return {
+            "status": "unavailable",
+            "direction": "sqlite_to_postgres",
+            "limit": limit,
+            "message": "DATABASE_URL 환경변수가 설정되지 않았어요.",
+        }
+
+    from database import get_db_connection
+
+    sq_conn = sqlite3.connect(db_file)
+    sq_conn.row_factory = sqlite3.Row
+    sq_cur = sq_conn.cursor()
+
+    pg_conn = get_db_connection()
+    pg_cur = pg_conn.cursor()
+
+    try:
+        # 소스/이슈/카테고리 정보 포함하여 기사 조회
+        sql = """
+            SELECT
+                p.*,
+                s.name AS source_name,
+                i.issue_title,
+                i.representative_summary,
+                i.keywords_json,
+                i.issue_hash,
+                i.published_at AS issue_published_at,
+                i.created_at AS issue_created_at,
+                i.updated_at AS issue_updated_at,
+                c.name AS category_name
+            FROM news_perspectives p
+            LEFT JOIN sources s ON p.source_id = s.id
+            LEFT JOIN news_issues i ON p.issue_id = i.id
+            LEFT JOIN categories c ON i.category_id = c.id
+            ORDER BY COALESCE(p.published_at, p.created_at) DESC, p.id DESC
+        """
+        params: List[Any] = []
+        if limit is not None and int(limit) > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        sql += ";"
+
+        sq_cur.execute(sql, params)
+        rows = [dict(r) for r in sq_cur.fetchall()]
+
+        inserted = 0
+        skipped = 0
+
+        for r in rows:
+            url = (r.get("url") or "").strip()
+            if not url:
+                skipped += 1
+                continue
+
+            pg_cur.execute("SELECT 1 FROM news_perspectives WHERE url = %s;", (url,))
+            if pg_cur.fetchone():
+                skipped += 1
+                continue
+
+            cat_id = _get_or_create_pg_category(pg_cur, r.get("category_name"))
+            src_id = _get_or_create_pg_source(pg_cur, r.get("source_name"))
+            issue_data = (
+                {
+                    "issue_title": r.get("issue_title"),
+                    "representative_summary": r.get("representative_summary"),
+                    "keywords_json": r.get("keywords_json"),
+                    "issue_hash": r.get("issue_hash"),
+                    "published_at": r.get("issue_published_at"),
+                    "created_at": r.get("issue_created_at"),
+                    "updated_at": r.get("issue_updated_at"),
+                }
+                if r.get("issue_title") or r.get("issue_hash")
+                else None
+            )
+            issue_id = _get_or_create_pg_issue(pg_cur, issue_data, cat_id)
+
+            pg_cur.execute(
+                """
+                INSERT INTO news_perspectives (
+                    issue_id, source_id, title, author_name, url,
+                    summary_facts, author_opinion, stance_type, raw_content,
+                    content_hash, thumbnail_url, processing_status,
+                    model_version, metadata_json, published_at, created_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+                ON CONFLICT (url) DO NOTHING;
+                """,
+                (
+                    issue_id,
+                    src_id,
+                    r.get("title") or "",
+                    r.get("author_name"),
+                    url,
+                    r.get("summary_facts"),
+                    r.get("author_opinion"),
+                    r.get("stance_type") or "중립",
+                    r.get("raw_content"),
+                    r.get("content_hash"),
+                    r.get("thumbnail_url"),
+                    r.get("processing_status") or "COMPLETED",
+                    r.get("model_version"),
+                    r.get("metadata_json"),
+                    r.get("published_at"),
+                    r.get("created_at"),
+                ),
+            )
+            if pg_cur.rowcount and pg_cur.rowcount > 0:
+                inserted += 1
+            else:
+                skipped += 1
+
+        pg_conn.commit()
+        return {
+            "status": "ok",
+            "direction": "sqlite_to_postgres",
+            "limit": limit,
+            "fetched_count": len(rows),
+            "inserted_count": inserted,
+            "skipped_count": skipped,
+        }
+    except Exception as e:
+        pg_conn.rollback()
+        return {
+            "status": "error",
+            "direction": "sqlite_to_postgres",
+            "limit": limit,
+            "message": f"SQLite -> Neon DB 동기화 실패: {e}",
+        }
+    finally:
+        sq_cur.close()
+        sq_conn.close()
+        pg_cur.close()
+        pg_conn.close()
+
+
+def sync_postgres_to_sqlite(
+    limit: Optional[int] = None,
+    sqlite_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Neon DB(PostgreSQL) -> 로컬 SQLite 단방향 동기화 (중복 스킵, 원본 유지)."""
+    db_file = _resolve_sqlite_path(sqlite_path)
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    if not db_url:
+        return {
+            "status": "unavailable",
+            "direction": "postgres_to_sqlite",
+            "limit": limit,
+            "message": "DATABASE_URL 환경변수가 설정되지 않았어요.",
+        }
+
+    from database import get_db_connection
+
+    os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
+    sq_conn = sqlite3.connect(db_file)
+    _ensure_sqlite_tables(sq_conn)
+    sq_cur = sq_conn.cursor()
+
+    pg_conn = get_db_connection()
+    pg_cur = pg_conn.cursor()
+
+    try:
+        sql = """
+            SELECT
+                p.issue_id,
+                p.source_id,
+                p.title,
+                p.author_name,
+                p.url,
+                p.summary_facts,
+                p.author_opinion,
+                p.stance_type,
+                p.raw_content,
+                p.content_hash,
+                p.thumbnail_url,
+                p.processing_status,
+                p.model_version,
+                p.metadata_json,
+                p.published_at::text,
+                p.created_at::text,
+                s.name AS source_name,
+                i.issue_title,
+                i.representative_summary,
+                i.keywords_json::text,
+                i.issue_hash,
+                i.published_at::text AS issue_published_at,
+                i.created_at::text AS issue_created_at,
+                i.updated_at::text AS issue_updated_at,
+                c.name AS category_name
+            FROM news_perspectives p
+            LEFT JOIN sources s ON p.source_id = s.id
+            LEFT JOIN news_issues i ON p.issue_id = i.id
+            LEFT JOIN categories c ON i.category_id = c.id
+            ORDER BY COALESCE(p.published_at::text, p.created_at::text) DESC, p.id DESC
+        """
+        params: List[Any] = []
+        if limit is not None and int(limit) > 0:
+            sql += " LIMIT %s"
+            params.append(int(limit))
+        sql += ";"
+
+        pg_cur.execute(sql, params)
+        cols = [desc[0] for desc in pg_cur.description]
+        rows = [dict(zip(cols, r)) for r in pg_cur.fetchall()]
+
+        inserted = 0
+        skipped = 0
+
+        for r in rows:
+            url = (r.get("url") or "").strip()
+            if not url:
+                skipped += 1
+                continue
+
+            sq_cur.execute("SELECT 1 FROM news_perspectives WHERE url = ?;", (url,))
+            if sq_cur.fetchone():
+                skipped += 1
+                continue
+
+            cat_id = _get_or_create_sqlite_category(sq_cur, r.get("category_name"))
+            src_id = _get_or_create_sqlite_source(sq_cur, r.get("source_name"))
+            issue_data = (
+                {
+                    "issue_title": r.get("issue_title"),
+                    "representative_summary": r.get("representative_summary"),
+                    "keywords_json": r.get("keywords_json"),
+                    "issue_hash": r.get("issue_hash"),
+                    "published_at": r.get("issue_published_at"),
+                    "created_at": r.get("issue_created_at"),
+                    "updated_at": r.get("issue_updated_at"),
+                }
+                if r.get("issue_title") or r.get("issue_hash")
+                else None
+            )
+            issue_id = _get_or_create_sqlite_issue(sq_cur, issue_data, cat_id)
+
+            sq_cur.execute(
+                """
+                INSERT OR IGNORE INTO news_perspectives (
+                    issue_id, source_id, title, author_name, url,
+                    summary_facts, author_opinion, stance_type, raw_content,
+                    content_hash, thumbnail_url, processing_status,
+                    model_version, metadata_json, published_at, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?
+                );
+                """,
+                (
+                    issue_id,
+                    src_id,
+                    r.get("title") or "",
+                    r.get("author_name"),
+                    url,
+                    r.get("summary_facts"),
+                    r.get("author_opinion"),
+                    r.get("stance_type") or "중립",
+                    r.get("raw_content"),
+                    r.get("content_hash"),
+                    r.get("thumbnail_url"),
+                    r.get("processing_status") or "COMPLETED",
+                    r.get("model_version"),
+                    r.get("metadata_json"),
+                    r.get("published_at"),
+                    r.get("created_at"),
+                ),
+            )
+            if sq_cur.rowcount and sq_cur.rowcount > 0:
+                inserted += 1
+            else:
+                skipped += 1
+
+        sq_conn.commit()
+        return {
+            "status": "ok",
+            "direction": "postgres_to_sqlite",
+            "limit": limit,
+            "fetched_count": len(rows),
+            "inserted_count": inserted,
+            "skipped_count": skipped,
+            "sqlite_path": db_file,
+        }
+    except Exception as e:
+        sq_conn.rollback()
+        return {
+            "status": "error",
+            "direction": "postgres_to_sqlite",
+            "limit": limit,
+            "message": f"Neon DB -> SQLite 동기화 실패: {e}",
+        }
+    finally:
+        sq_cur.close()
+        sq_conn.close()
+        pg_cur.close()
+        pg_conn.close()
