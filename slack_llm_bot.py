@@ -13,7 +13,7 @@ from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-
+from tool_rag_router import MCP_TOOL_REGISTRY, retrieve_top_tools
 load_dotenv()
 
 _CRAWL_LOCK = threading.Lock()
@@ -151,11 +151,8 @@ TOOL_GROUPS: Dict[str, List[Dict[str, str]]] = {
     ],
 }
 
-VALID_TOOLS = {
-    item["tool"]
-    for tools in TOOL_GROUPS.values()
-    for item in tools
-} | {"none"}
+
+VALID_TOOLS = {item["tool"] for item in MCP_TOOL_REGISTRY} | {"none"}
 
 
 def _clean_mention_text(text: str) -> str:
@@ -324,57 +321,56 @@ def _route_tool_group(user_text: str) -> str:
     return group if group in ("storage", "content", "none") else "none"
 
 
+
 def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
-    """2단계 선택기: 라우터가 고른 그룹의 도구 목록을 바탕으로 도구와 파라미터를 LLM이 직접 해석."""
-    group = _route_tool_group(user_text)
-    if group == "none":
+    """키워드/태그/그룹(+선택적 임베딩)으로 추린 상위 3개 도구만 LLM에 넘겨 JSON 인자를 추출."""
+    top_tools = retrieve_top_tools(user_text, top_k=3, min_score=1.5)
+    if not top_tools:
+        print(f"[DEBUG] text={user_text!r} -> no matching tools (score below threshold)", file=sys.stderr)
         return {"tool": "none"}
 
-    candidates = TOOL_GROUPS[group]
-    if group == "storage":
-        system_prompt = (
-            "당신은 저장소 및 동기화 MCP 도구 선택기입니다. 사용자 발화의 의도, 출발지/목적지 방향, "
-            "대상 저장소, 삭제 조건(언론사/분야/키워드/일수/건수/정렬순서/전체삭제)을 문맥으로 파악해 "
-            "순수 JSON 1개만 출력하세요.\n"
-            f"{json.dumps(candidates, ensure_ascii=False, indent=2)}\n\n"
-            "판별 기준:\n"
-            "- 출발지가 로컬/파일/SQLite이고 목적지가 Neon/Postgres/디지털 DB/DB인 동기화 -> sync_sqlite_to_postgres\n"
-            "- 출발지가 Neon/Postgres/디지털 DB/DB이고 목적지가 로컬/파일/SQLite인 동기화 -> sync_postgres_to_sqlite\n"
-            "- 저장소 모드/백엔드 자체를 변경 -> set_storage_backend (storage_backend에 'sqlite' 또는 'postgres')\n"
-            "- SQLite 파일 자체를 내보내기/다운로드 -> export_sqlite_file\n"
-            "- 현재 저장소 설정/연결/파일 상태 확인 -> get_storage_status\n"
-            "- 기사 건수/언론사/분야/기간 통계 조회 -> get_storage_stats (특정 저장소가 언급되면 target_backend에 'sqlite' 또는 'postgres', 없으면 null)\n"
-            "- 특정 조건/전체 뉴스 삭제 -> delete_news_records "
-            "(target_backend: 'sqlite'|'postgres'|null, source, category, keyword, days, limit, "
-            "order: 'oldest' 또는 'newest', delete_all: boolean)\n"
-            "- 해당 없음 -> none\n\n"
-            "order 및 limit 규칙:\n"
-            "- '오래된/가장 먼저/옛날' N개 -> order: 'oldest', limit: N\n"
-            "- '최근/방금/최신' N개 또는 방향 언급 없음 -> order: 'newest', limit: N (제한 언급 없으면 null)\n\n"
-            '출력 형식: {"tool": "...", "storage_backend": null, "target_backend": null, '
-            '"source": null, "category": null, "keyword": null, "days": null, '
-            '"limit": null, "order": "newest", "delete_all": false}'
-        )
-    else:
-        system_prompt = (
-            "당신은 뉴스 수집 및 퀴즈 MCP 도구 선택기입니다. 사용자 발화를 문맥으로 파악해 "
-            "순수 JSON 1개만 출력하세요.\n"
-            f"{json.dumps(candidates, ensure_ascii=False, indent=2)}\n\n"
-            '출력 형식: {"tool": "run_rss_by_request | get_recent_news_for_quiz | none", "category": "전체", "limit": 3}'
-        )
+    compact_candidates = [
+        {
+            "tool": t["tool"],
+            "description": t["description"],
+            "examples": (t.get("examples") or [])[:3],
+            "schema": t["schema"],
+        }
+        for t in top_tools
+    ]
 
-    raw = _invoke_llm_with_fallback(
-        messages=[SystemMessage(content=system_prompt), HumanMessage(content=user_text)],
-        temperature=0.0,
-        max_tokens=300,
-        prefer_local=False,
+    system_prompt = (
+        "당신은 MCP 도구 호출 JSON 생성기입니다. "
+        "설명이나 마크다운 없이 오직 JSON 객체 1개만 출력하세요.\n"
+        f"후보 도구 목록:\n{json.dumps(compact_candidates, ensure_ascii=False)}\n\n"
+        "규칙:\n"
+        "- 후보 중 요청 의도에 맞는 도구를 고르고 해당 schema 형식대로 JSON을 채우세요.\n"
+        "- 어느 도구에도 해당하지 않는 일반 대화면 {\"tool\": \"none\"}을 출력하세요.\n"
+        "- delete_news_records일 때 source에는 언론사/섹션명만 넣고('정보','기사','데이터' 제외), "
+        "'오래된/옛날/가장 먼저'면 order='oldest', '최근/최신'이면 order='newest'로 하세요.\n"
+        "- delete_news_records에서 source/category/keyword/days/limit 중 하나라도 있으면 delete_all은 반드시 false로 하세요."
     )
-    parsed = _extract_json(raw or "")
-    if parsed and parsed.get("tool") in VALID_TOOLS:
-        return parsed
-    print(f"[DEBUG] text={user_text!r} -> parsed={parsed}", file=sys.stderr)
-    return {"tool": "none"}
 
+    for attempt in range(2):
+        raw = _invoke_llm_with_fallback(
+            messages=[
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=f"요청: {user_text}\nJSON:"),
+            ],
+            temperature=0.0,
+            max_tokens=400,
+            prefer_local=False,
+        )
+        parsed = _extract_json(raw or "")
+        print(
+            f"[DEBUG] text={user_text!r} top={[t['tool'] for t in top_tools]} "
+            f"attempt={attempt+1} -> parsed={parsed}",
+            file=sys.stderr,
+        )
+        if parsed and parsed.get("tool") in VALID_TOOLS:
+            return parsed
+
+    return {"tool": "none"}
 
 def ask_llm_for_quiz(prompt: str) -> str:
     prefer_local = (os.getenv("QUIZ_LLM_PROVIDER") or "").strip().lower() == "ollama"
