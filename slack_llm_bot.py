@@ -258,51 +258,65 @@ def _invoke_llm_with_fallback(
         return groq_res
     return _run_ollama()
 
+def _build_candidate_input_specs(top_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    for t in top_tools:
+        specs.append({
+            "tool": t.get("tool"),
+            "description": t.get("description", ""),
+            "examples": (t.get("examples") or [])[:2],
+            "inputs": t.get("schema") or {},
+        })
+    return specs
+
+def _unwrap_tool_args(chosen: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(chosen or {})
+    nested = merged.get("inputs")
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            if k not in merged or merged[k] is None:
+                merged[k] = v
+    return merged
+def _clean_str_arg(val: Any) -> Optional[str]:
+    if val is None or isinstance(val, bool):
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("null", "none") or "|" in s:
+        return None
+    return s
 
 def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
-    """키워드/태그/그룹(+선택적 임베딩)으로 추린 후보 도구만 LLM에 넘겨 JSON 인자를 추출."""
     top_tools = retrieve_top_tools(user_text, top_k=3, min_score=1.5)
     if not top_tools:
         print(f"[DEBUG] text={user_text!r} -> no matching tools (score below threshold)", file=sys.stderr)
         return {"tool": "none"}
 
-    compact_candidates = [
-        {
-            "tool": t["tool"],
-            "description": t["description"],
-            "examples": (t.get("examples") or [])[:3],
-            "schema": t["schema"],
-        }
-        for t in top_tools
-    ]
+    candidate_inputs = _build_candidate_input_specs(top_tools)
 
     system_prompt = (
-        "당신은 MCP 도구 호출 JSON 생성기입니다. "
-        "설명이나 마크다운 없이 오직 JSON 객체 1개만 출력하세요.\n"
-        f"후보 도구 목록:\n{json.dumps(compact_candidates, ensure_ascii=False)}\n\n"
-        "규칙:\n"
-        "- 후보 중 요청 의도에 맞는 도구를 고르고 해당 schema 형식대로 JSON을 채우세요.\n"
-        "- 기간(~동안, ~까지, 내일/모레/요일/날짜)이나 반복 간격(~마다, ~텀, ~간격, ~씩)이 있으면 "
-        "반드시 schedule_rss_collection을 선택하고, 1회성 수집 요청이면 run_rss_by_request를 선택하세요.\n"
-        "- 어느 도구에도 해당하지 않는 일반 대화면 {\"tool\": \"none\"}을 출력하세요.\n"
-        "- delete_news_records일 때 source에는 언론사/섹션명만 넣고('정보','기사','데이터' 제외), "
-        "'오래된/옛날/가장 먼저'면 order='oldest', '최근/최신'이면 order='newest'로 하세요.\n"
-        "- delete_news_records에서 source/category/keyword/days/limit 중 하나라도 있으면 delete_all은 반드시 false로 하세요."
+        "당신은 사용자 요청의 최종 목적(서술어)을 파악해 후보 도구 중 가장 알맞은 JSON 1개를 출력하는 라우터입니다.\n"
+        "판단 규칙:\n"
+        "1. 앞부분의 수식어보다 문장의 최종 행동(예: '~로 변경/전환' vs '~파일 추출/다운로드')을 기준으로 도구를 선택하세요.\n"
+        "   - 저장 방식/모드를 바꾸는 요청 -> set_storage_backend\n"
+        "   - DB 파일 자체를 다운로드/업로드해 달라는 요청 -> export_sqlite_file\n"
+        "2. 마크다운, 코드블록, 부가 설명 없이 오직 순수 JSON 객체 1개만 출력하세요.\n"
+        "3. 후보 중 맞는 도구가 없으면 {\"tool\": \"none\"}을 출력하세요.\n\n"
+        f"후보 도구 목록:\n{json.dumps(candidate_inputs, ensure_ascii=False)}"
     )
 
     for attempt in range(2):
         raw = _invoke_llm_with_fallback(
             messages=[
                 SystemMessage(content=system_prompt),
-                HumanMessage(content=f"요청: {user_text}\nJSON:"),
+                HumanMessage(content=user_text),
             ],
             temperature=0.0,
             max_tokens=400,
-            prefer_local=False,
+            prefer_local=True,
         )
         parsed = _extract_json(raw or "")
         print(
-            f"[DEBUG] text={user_text!r} top={[t['tool'] for t in top_tools]} "
+            f"[DEBUG] text={user_text!r} candidates={[c['tool'] for c in candidate_inputs]} "
             f"attempt={attempt+1} -> parsed={parsed}",
             file=sys.stderr,
         )
@@ -310,7 +324,6 @@ def _choose_mcp_tool(user_text: str) -> Dict[str, Any]:
             return parsed
 
     return {"tool": "none"}
-
 
 def ask_llm_for_quiz(prompt: str) -> str:
     prefer_local = (os.getenv("QUIZ_LLM_PROVIDER") or "").strip().lower() == "ollama"
@@ -443,18 +456,22 @@ def _extract_request_text_from_user(user_text: str) -> str:
     return cleaned or user_text.strip()
 
 
+# slack_llm_bot.py 내 build_schedule_request_with_llm 및 _parse_schedule_plan 개선
+
 def build_schedule_request_with_llm(
     user_text: str,
     chosen: Dict[str, Any],
     call_llm_fn: Optional[Any] = None,
 ) -> str:
-    """user_text에서 기간/주기 표현을 제외한 순수 RSS 수집 요청을 LLM으로 정제."""
+    """user_text에서 기간/반복간격만 제거하고 수집 대상/분야/언론사/개수/키워드는 유지합니다."""
     llm_hint = str(chosen.get("request_text") or "").strip()
     prompt = (
-        "다음 사용자 요청에서 '기간(동안/까지)'과 '반복 간격(마다/텀/간격/씩)'에 해당하는 시간 표현만 제거하고, "
-        "RSS 뉴스 수집에 필요한 '수집 대상/분야/언론사/개수/키워드' 요청만 자연스러운 한국어 한 문장으로 남겨줘.\n"
-        "특정 대상이나 개수가 없다면 '요청된 조건에 맞춰 뉴스 수집'처럼 원문 의도를 살려 짧게 요약하고, "
-        "따옴표나 부가 설명 없이 요청 문장만 출력해.\n\n"
+        "다음 사용자 요청에서 '기간(동안/까지)'과 '반복 간격(마다/텀/간격)' 표현만 제거하고, "
+        "'수집 대상/분야/언론사/개수(N개씩, N건 등)/키워드'는 반드시 남긴 자연스러운 한국어 한 문장을 만드세요.\n"
+        "예시:\n"
+        "- 입력: '13시 20분까지 4분마다 30개씩 it 뉴스 가져와' -> 출력: '30개씩 it 뉴스 수집'\n"
+        "- 입력: '2시간 동안 15분마다 경제 뉴스 3개씩 모아줘' -> 출력: '경제 뉴스 3개씩 수집'\n"
+        "따옴표나 설명 없이 한 문장만 출력하세요.\n\n"
         f"사용자 원문: {user_text}\n"
         f"초기 추출 힌트: {llm_hint or '없음'}"
     )
@@ -470,7 +487,7 @@ def build_schedule_request_with_llm(
                 ],
                 temperature=0.0,
                 max_tokens=150,
-                prefer_local=False,
+                prefer_local=True,
             )
         cleaned_llm = str(raw_out or "").strip().strip('"').strip("'").strip("`")
         if cleaned_llm:
@@ -482,6 +499,21 @@ def build_schedule_request_with_llm(
         return llm_hint
     return _extract_request_text_from_user(user_text)
 
+# plan_sources_from_request.py 내 _extract_explicit_limit 개선
+
+def _extract_explicit_limit(request_text: str) -> Optional[int]:
+    if not request_text:
+        return None
+    # '4분마다', '10초마다', '3시간마다' 등 시간 주기는 개수로 오인하지 않도록 제외
+    m = re.search(
+        r"(?:각\s*)?(\d+)\s*(?:개|건|기사|뉴스)\s*(?:씩)?(?:\s*(?:가져와|모아줘|수집|긁어와|저장))?",
+        request_text,
+    )
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= 50:
+            return val
+    return None
 
 def _parse_schedule_plan(user_text: str, chosen: Dict[str, Any]) -> Dict[str, Any]:
     now = datetime.now()
@@ -1140,22 +1172,39 @@ def handle_mention(event, say, client):
         return
 
     if tool == "delete_news_records":
-        target_backend = _normalize_backend_value(chosen.get("target_backend"))
-        source_val = (chosen.get("source") or "").strip() or None
-        category_val = (chosen.get("category") or "").strip() or None
-        keyword_val = (chosen.get("keyword") or "").strip() or None
-        days_val = _normalize_positive_int(chosen.get("days"), default=None)
-        limit_val = _normalize_positive_int(chosen.get("limit"), default=None)
-
-        raw_order = str(chosen.get("order") or "").strip().lower()
-        if raw_order in ("oldest", "asc", "오래된", "과거") or any(
-            k in user_text for k in ("오래된", "옛날", "가장 먼저", "먼저 들어온")
-        ):
-            order_val = "oldest"
+        chosen = _unwrap_tool_args(chosen)
+        print(f"[DEBUG_DEL] chosen={chosen} delete_all_raw={chosen.get('delete_all')}", file=sys.stderr)
+        raw_delete_all = chosen.get("delete_all")
+        if isinstance(raw_delete_all, bool):
+            delete_all_val = raw_delete_all
+        elif isinstance(raw_delete_all, str):
+            delete_all_val = raw_delete_all.strip().lower() in ("true", "1", "yes")
         else:
-            order_val = "newest"
+            delete_all_val = False
 
-        delete_all_val = bool(chosen.get("delete_all") is True)
+        target_backend = _normalize_backend_value(_clean_str_arg(chosen.get("target_backend")))
+
+        if delete_all_val:
+            source_val = None
+            category_val = None
+            keyword_val = None
+            days_val = None
+            limit_val = None
+            order_val = "newest"
+        else:
+            source_val = _clean_str_arg(chosen.get("source"))
+            category_val = _clean_str_arg(chosen.get("category"))
+            keyword_val = _clean_str_arg(chosen.get("keyword"))
+            days_val = _normalize_positive_int(chosen.get("days"), default=None)
+            limit_val = _normalize_positive_int(chosen.get("limit"), default=None)
+
+            raw_order = str(_clean_str_arg(chosen.get("order")) or "").strip().lower()
+            if raw_order in ("oldest", "asc", "오래된", "과거") or any(
+                k in user_text for k in ("오래된", "옛날", "가장 먼저", "먼저 들어온")
+            ):
+                order_val = "oldest"
+            else:
+                order_val = "newest"
 
         raw_res = mcp_tools.delete_news_records(
             source=source_val,
@@ -1168,11 +1217,12 @@ def handle_mention(event, say, client):
             target_backend=target_backend,
             sqlite_path=DEFAULT_SQLITE_PATH,
         )
-        data = json.loads(raw_res)
-        if data.get("status") != "ok":
-            say(text=f"⚠️ 삭제 처리 안내: {data.get('message') or '삭제할 수 없었어요.'}")
+        data = json.loads(raw_res) if raw_res else {}
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            err_msg = data.get("message") if isinstance(data, dict) else None
+            say(text=f"⚠️ 삭제 처리 안내: {err_msg or '삭제할 수 없었어요.'}")
             return
-
+        
         applied = data.get("filters") or {}
         cond_parts = []
         if applied.get("delete_all"):
@@ -1200,7 +1250,6 @@ def handle_mention(event, say, client):
             )
         )
         return
-
 
 @app.event("message")
 def handle_message_events(event, say):

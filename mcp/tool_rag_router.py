@@ -5,11 +5,37 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
+# 동의어 및 활용형 정규화 매핑
+SYNONYM_MAP: Dict[str, str] = {
+    "바꿔": "변경",
+    "바꾸": "변경",
+    "전환": "변경",
+    "교체": "변경",
+    "내보내": "추출",
+    "내보내기": "추출",
+    "다운": "다운로드",
+    "받아": "다운로드",
+    "보내": "추출",
+    "지워": "삭제",
+    "비워": "삭제",
+    "없애": "삭제",
+    "제거": "삭제",
+    "모아": "수집",
+    "긁어": "수집",
+    "가져와": "수집",
+    "크롤링": "수집",
+    "네온": "postgres",
+    "디지털": "postgres",
+    "postgresql": "postgres",
+    "로컬": "sqlite",
+}
+
 MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "delete_news_records",
         "group": "storage",
-        "tags": ["삭제", "지워", "비워", "없애", "오래된", "최근", "전체", "전부", "언론사", "키워드", "기간", "건수"],
+        "intent_tags": ["삭제", "지워", "비워", "없애", "제거"],
+        "tags": ["오래된", "최근", "전체", "전부", "언론사", "키워드", "기간", "건수", "db", "sqlite", "postgres"],
         "description": "언론사/섹션, 분야, 키워드, 최근 일수(days), 건수(limit), 정렬순서(oldest/newest) 또는 전체(delete_all) 조건으로 저장된 뉴스 데이터를 삭제한다.",
         "examples": [
             "오래된 연합/정치 정보 3개 삭제해줘",
@@ -24,19 +50,20 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
         "schema": {
             "tool": "delete_news_records",
             "target_backend": "sqlite | postgres | null",
-            "source": "언론사/섹션명만('정보','기사','데이터' 제외) | null",
+            "source": "언론사/섹션명만 | null",
             "category": "분야명 | null",
             "keyword": "키워드 | null",
             "days": "정수 | null",
             "limit": "정수 | null",
             "order": "oldest | newest",
-            "delete_all": "boolean (다른 필터가 있으면 반드시 false)",
+            "delete_all": "boolean (전부/모두/전체 삭제면 true, 특정 조건 삭제면 false)",
         },
     },
     {
         "tool": "get_storage_stats",
         "group": "storage",
-        "tags": ["통계", "건수", "몇 건", "분포", "언론사별", "분야별", "기간", "현황", "db", "sqlite", "postgres"],
+        "intent_tags": ["통계", "건수", "몇 건", "분포", "현황"],
+        "tags": ["언론사별", "분야별", "기간", "db", "sqlite", "postgres"],
         "description": "저장소(sqlite 또는 postgres)의 총 기사 수, 언론사별·분야별 분포, 기사 기간 통계를 조회한다.",
         "examples": [
             "현재 db 통계",
@@ -53,7 +80,8 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "get_storage_status",
         "group": "storage",
-        "tags": ["상태", "연결", "확인", "모드", "저장소", "어디", "db", "sqlite", "postgres", "네온"],
+        "intent_tags": ["상태", "연결", "확인", "어디"],
+        "tags": ["모드", "저장소", "db", "sqlite", "postgres", "네온"],
         "description": "현재 활성 저장소 모드와 SQLite 파일 및 PostgreSQL 연결 상태를 확인한다.",
         "examples": [
             "저장소 상태 확인해줘",
@@ -66,12 +94,14 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "set_storage_backend",
         "group": "storage",
-        "tags": ["변경", "바꿔", "전환", "모드", "저장소", "sqlite", "파일", "로컬", "postgres", "네온", "db"],
-        "description": "활성 저장소 모드를 sqlite(로컬 파일) 또는 postgres(Neon DB)로 전환한다.",
+        "intent_tags": ["변경", "바꿔", "전환", "모드"],
+        "tags": ["저장소", "형태", "sqlite", "파일", "로컬", "postgres", "네온", "db"],
+        "description": "활성 저장소 백엔드(저장 모드)를 sqlite(로컬 파일 형태) 또는 postgres(Neon DB)로 전환한다. 파일을 다운로드하는 도구가 아니다.",
         "examples": [
             "네온db로 변경해줘",
             "sqlite로 바꿔줘",
             "저장 상태를 파일 형태로 바꿔줘",
+            "파일형태를 추출할 수 있는 sqlite형태로 변경",
             "디지털 DB로 저장하게 해줘",
         ],
         "schema": {
@@ -82,8 +112,9 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "export_sqlite_file",
         "group": "storage",
-        "tags": ["추출", "다운로드", "내보내기", "보내줘", "파일", "sqlite", "db"],
-        "description": "로컬 SQLite DB 파일(news_store.sqlite)을 Slack으로 추출/다운로드한다.",
+        "intent_tags": ["추출", "다운로드", "내보내기", "보내줘"],
+        "tags": ["파일", "sqlite", "db"],
+        "description": "로컬 SQLite DB 파일(news_store.sqlite) 자체를 Slack 채널로 업로드해 다운로드하게 한다. 저장소 모드를 변경하는 도구가 아니다.",
         "examples": [
             "파일 추출해",
             "sqlite 파일 추출해줘",
@@ -95,7 +126,8 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "sync_sqlite_to_postgres",
         "group": "storage",
-        "tags": ["동기화", "올려", "이동", "가져와", "sqlite", "파일", "로컬", "postgres", "네온", "디지털"],
+        "intent_tags": ["동기화", "올려", "이동"],
+        "tags": ["sqlite", "파일", "로컬", "postgres", "네온", "디지털"],
         "description": "로컬 SQLite 파일 데이터를 Neon DB(PostgreSQL)로 단방향 동기화한다.",
         "examples": [
             "sqlite를 postgres로 동기화해줘",
@@ -110,7 +142,8 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "sync_postgres_to_sqlite",
         "group": "storage",
-        "tags": ["동기화", "내려받기", "가져와", "이동", "postgres", "네온", "디지털", "sqlite", "파일", "로컬"],
+        "intent_tags": ["동기화", "내려받기", "이동"],
+        "tags": ["postgres", "네온", "디지털", "sqlite", "파일", "로컬"],
         "description": "Neon DB(PostgreSQL) 데이터를 로컬 SQLite 파일로 단방향 내려받기 동기화한다.",
         "examples": [
             "postgres를 sqlite로 동기화해줘",
@@ -125,7 +158,8 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "run_rss_by_request",
         "group": "content",
-        "tags": ["수집", "크롤링", "모아줘", "가져와", "긁어와", "저장", "뉴스", "기사", "정보", "rss", "언론사", "분야"],
+        "intent_tags": ["수집", "크롤링", "모아줘", "가져와", "긁어와"],
+        "tags": ["저장", "뉴스", "기사", "정보", "rss", "언론사", "분야"],
         "description": "자연어 요청을 해석해 언론사/분야별 RSS 뉴스를 크롤링 및 수집한다.",
         "examples": [
             "언론사별 각 정보 4개씩 가져와",
@@ -138,7 +172,8 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "get_recent_news_for_quiz",
         "group": "content",
-        "tags": ["퀴즈", "문제", "출제", "만들어줘", "내줘", "시사", "뉴스"],
+        "intent_tags": ["퀴즈", "문제", "출제", "내줘"],
+        "tags": ["시사", "뉴스", "만들어줘"],
         "description": "저장된 최근 뉴스를 조회해 시사 퀴즈 문제를 생성한다.",
         "examples": [
             "경제 뉴스로 퀴즈 내줘",
@@ -154,9 +189,9 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
     {
         "tool": "schedule_rss_collection",
         "group": "content",
+        "intent_tags": ["주기", "마다", "간격", "동안", "까지", "예약", "자동"],
         "tags": [
-            "주기", "마다", "간격", "동안", "까지", "시간", "분", "초",
-            "요일", "주", "내일", "모레", "년", "월", "일", "예약", "자동",
+            "시간", "분", "초", "요일", "주", "내일", "모레", "년", "월", "일",
             "수집", "크롤링", "모아줘", "가져와", "긁어와", "뉴스", "기사", "rss",
         ],
         "description": (
@@ -201,24 +236,72 @@ def _normalize_tokens(text: str) -> List[str]:
     lowered = (text or "").lower()
     cleaned = re.sub(r"[^0-9a-zA-Z가-힣/]+", " ", lowered)
     tokens: List[str] = []
+
     for raw in cleaned.split():
         tokens.append(raw)
+
+        # 복합어 내부 핵심 영문/한글 키워드 분해 (예: 네온db -> 네온, db / 파일형태 -> 파일, 형태)
+        sub_parts = re.findall(r"[a-z]+|[0-9]+|[가-힣]+", raw)
+        if len(sub_parts) > 1:
+            tokens.extend(sub_parts)
+
+        # 한국어 조사 및 동사/형용사 활용 어미 제거
         trimmed = re.sub(
-            r"(을|를|이|가|은|는|에|에서|로|으로|와|과|의|도|만|까지|부터|해줘|해주세요|해봐|해|줘)$",
+            r"(을|를|이|가|은|는|에|에서|로|으로|와|과|의|도|만|까지|부터|"
+            r"해줘|해주세요|해봐|해|줘|할|하는|한|된|될|되는|해서|하여|하고|싶어)$",
             "",
             raw,
         )
         if trimmed and trimmed != raw:
             tokens.append(trimmed)
-    return tokens
+
+    # 동의어/어간 표준화 추가
+    normalized: List[str] = []
+    for tok in tokens:
+        normalized.append(tok)
+        if tok in SYNONYM_MAP:
+            normalized.append(SYNONYM_MAP[tok])
+
+    return list(dict.fromkeys(normalized))
+
+
+def _apply_intent_rules(tool_name: str, lowered_text: str, tokens: Set[str]) -> float:
+    """문장 끝/주서술어 중심의 의도 보정 규칙."""
+    bonus = 0.0
+
+    # 저장소 백엔드 전환 의도 ("~로 변경", "~로 바꿔", "~형태로 전환")
+    is_backend_switch = bool(
+        re.search(r"(?:형태|모드|방식|저장소|sqlite|postgres|네온|db)\s*(?:으?로)?\s*(?:변경|바꿔|바꾸|전환)", lowered_text)
+    )
+    if is_backend_switch:
+        if tool_name == "set_storage_backend":
+            bonus += 5.0
+        elif tool_name == "export_sqlite_file":
+            # '추출할 수 있는 sqlite형태로 변경'처럼 수식절에 '추출'이 쓰인 경우 감점
+            bonus -= 3.5
+
+    # 순수 파일 추출/다운로드 의도 ("파일 추출", "db 다운로드", "sqlite 보내줘")
+    is_file_export = bool(
+        re.search(r"(?:파일|sqlite|db)\s*(?:을|를)?\s*(?:추출|다운로드|내보내|보내)", lowered_text)
+    ) and not is_backend_switch
+    if is_file_export and tool_name == "export_sqlite_file":
+        bonus += 4.5
+
+    # 동기화 방향 명확화
+    if "동기화" in tokens or "이동" in tokens:
+        if re.search(r"(?:sqlite|파일|로컬).*(?:postgres|네온|디지털)", lowered_text) and tool_name == "sync_sqlite_to_postgres":
+            bonus += 4.0
+        elif re.search(r"(?:postgres|네온|디지털).*(?:sqlite|파일|로컬)", lowered_text) and tool_name == "sync_postgres_to_sqlite":
+            bonus += 4.0
+
+    return bonus
 
 
 def _get_optional_embedding(text: str) -> Optional[List[float]]:
-    """임베딩 설정이 있을 때만 벡터를 구하고, 없으면 None을 반환."""
-    if text in _EMBED_CACHE:
-        return _EMBED_CACHE[text]
+    cache_key = " ".join((text or "").lower().split())
+    if cache_key in _EMBED_CACHE:
+        return _EMBED_CACHE[cache_key]
 
-    # 1) 로컬 Ollama 임베딩 모델
     ollama_embed_model = (os.getenv("OLLAMA_EMBED_MODEL") or "").strip()
     if ollama_embed_model:
         base_url = (os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").strip()
@@ -231,12 +314,11 @@ def _get_optional_embedding(text: str) -> Optional[List[float]]:
             if resp.status_code == 200:
                 vec = (resp.json() or {}).get("embedding")
                 if isinstance(vec, list) and vec:
-                    _EMBED_CACHE[text] = vec
+                    _EMBED_CACHE[cache_key] = vec
                     return vec
         except Exception:
             pass
 
-    # 2) 상용 OpenAI 호환 임베딩 엔드포인트(설정된 경우에만)
     openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     openai_embed_model = (os.getenv("OPENAI_EMBED_MODEL") or "").strip()
     if openai_api_key and openai_embed_model:
@@ -255,7 +337,7 @@ def _get_optional_embedding(text: str) -> Optional[List[float]]:
                 data = (resp.json() or {}).get("data") or []
                 vec = (data[0] or {}).get("embedding") if data else None
                 if isinstance(vec, list) and vec:
-                    _EMBED_CACHE[text] = vec
+                    _EMBED_CACHE[cache_key] = vec
                     return vec
         except Exception:
             pass
@@ -277,10 +359,6 @@ def retrieve_top_tools(
     top_k: int = 3,
     min_score: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """
-    임베딩이 있으면 의미 유사도 + 키워드/태그/그룹 점수로,
-    임베딩이 없으면 키워드/태그/그룹 점수로 상위 top_k 도구를 추립니다.
-    """
     lowered_text = (user_text or "").lower()
     query_tokens = set(_normalize_tokens(user_text))
     query_vec = _get_optional_embedding(user_text)
@@ -295,21 +373,36 @@ def retrieve_top_tools(
     for item in MCP_TOOL_REGISTRY:
         kw_score = 0.0
 
-        tags = [str(t).lower() for t in (item.get("tags") or [])]
-        for tag in tags:
-            if tag in lowered_text or tag in query_tokens:
-                kw_score += 3.0
+        # 1) 핵심 의도 태그 (높은 가중치)
+        intent_tags = [str(t).lower() for t in (item.get("intent_tags") or [])]
+        for tag in intent_tags:
+            norm_tag = SYNONYM_MAP.get(tag, tag)
+            if tag in query_tokens or norm_tag in query_tokens or tag in lowered_text:
+                kw_score += 4.5
 
+        # 2) 보조 대상 명사 태그 (낮은 가중치: 공통 명사 쏠림 방지)
+        noun_tags = [str(t).lower() for t in (item.get("tags") or [])]
+        for tag in noun_tags:
+            norm_tag = SYNONYM_MAP.get(tag, tag)
+            if tag in query_tokens or norm_tag in query_tokens:
+                kw_score += 1.2
+
+        # 3) 그룹 힌트 점수
         grp = item.get("group", "")
         if grp in group_scores and group_scores[grp] > 0:
-            kw_score += min(group_scores[grp], 3) * 1.0
+            kw_score += min(group_scores[grp], 3) * 0.8
 
+        # 4) 설명 및 예시 토큰 겹침
         doc_blob = f"{item.get('description', '')} {' '.join(item.get('examples') or [])}"
         doc_tokens = set(_normalize_tokens(doc_blob))
-        kw_score += len(query_tokens & doc_tokens) * 0.8
+        kw_score += len(query_tokens & doc_tokens) * 0.7
 
+        # 5) 도구명 직접 매칭
         tool_parts = set(re.split(r"[_\s]+", str(item.get("tool", "")).lower()))
         kw_score += len(query_tokens & tool_parts) * 1.5
+
+        # 6) 의도 충돌/보강 규칙 적용
+        kw_score += _apply_intent_rules(item.get("tool", ""), lowered_text, query_tokens)
 
         total_score = kw_score
         if query_vec is not None:
@@ -338,7 +431,6 @@ def ensure_rss_pair_in_candidates(
     registry: List[Dict[str, Any]],
     max_k: int = 5,
 ) -> List[Dict[str, Any]]:
-    """단발 RSS와 주기 RSS가 서로 비교 가능하도록 후보군에 함께 포함."""
     by_name = {item["tool"]: item for item in registry}
     present = {item["tool"] for item in top_tools}
 
@@ -354,14 +446,12 @@ def ensure_rss_pair_in_candidates(
             result.append(by_name[peer_name])
             present.add(peer_name)
 
-    # 원래 max_k를 넘겼다면, 방금 보장한 두 도구는 유지하면서 뒤쪽 여유분만 정리
     if len(result) > max_k:
         protected = {"run_rss_by_request", "schedule_rss_collection"}
         trimmed: List[Dict[str, Any]] = []
         for item in result:
             if item["tool"] in protected or len(trimmed) < max_k - len(protected):
                 trimmed.append(item)
-        # 보호 대상이 빠지지 않도록 합집합 유지
         existing_names = {x["tool"] for x in trimmed}
         for item in result:
             if item["tool"] in protected and item["tool"] not in existing_names:
@@ -369,6 +459,3 @@ def ensure_rss_pair_in_candidates(
         result = trimmed
 
     return result
-
-
-

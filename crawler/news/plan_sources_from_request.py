@@ -137,32 +137,26 @@ def _infer_llm_plan(
     catalog_text = "\n".join(catalog_lines)
 
     system_prompt = (
-        "당신은 RSS 뉴스 수집 요청을 분석해 등록된 RSS 소스 목록과 유연하게 매칭하는 플래너입니다.\n"
-        "제공된 '등록된 RSS 소스 목록'의 키(source_name) 이름과 분야(category)를 보고 "
-        "사용자 요청 의도에 가장 알맞은 소스들을 선택해 유효한 JSON만 출력하세요.\n\n"
-        "출력 스키마:\n"
-        "{\n"
-        '  "default_limit": 5,\n'
-        '  "configs": [\n'
-        '    {"source_name": "목록의 정확한 source_name", "category": "카테고리", "limit": 3}\n'
-        "  ],\n"
-        '  "unsupported_items": ["목록에 없어 RSS로 제공할 수 없는 요청 항목"]\n'
-        "}\n\n"
-        "핵심 추론 원칙:\n"
-        "1. 등록된 소스 키(source_name)는 주로 '언론사/종합', '언론사/전체', '언론사/분야' 형태입니다.\n"
-        "2. '전체 언론사', '전 언론사', '언론사별 전반적 뉴스'처럼 세부 섹션을 지정하지 않은 전체 요청에서는 "
-        "세부 분야 피드(스포츠, 야구, 골프, 사설칼럼, 여행 등)를 무작정 다 넣기보다, "
-        "키 이름에 '종합'이나 '전체'가 포함된 대표 피드(예: 연합/종합, 경향/종합, 한경/전체, 한겨레/전체, "
-        "조선일보/전체, 조선비즈/전체, 조세일보/전체, 전자신문/전체, 동아/전체 등)를 중심으로 유연하게 선택하세요.\n"
-        "   단, '모든 RSS 피드/세부 섹션까지 전부'처럼 명시하면 목록 전체를 선택할 수 있습니다.\n"
-        "3. 특정 언론사명만 말하면(예: '조선일보', '동아') 해당 언론사의 대표/관련 키를 문맥에 맞게 고르고, "
-        "특정 분야나 키워드(예: '경제', 'AI/테크', '정치', '국제', '스포츠/야구')를 말하면 "
-        "키 이름과 category가 부합하는 소스들을 선택하세요.\n"
-        "4. RSS 소스 목록에 없는 주제나 요청(예: 날씨, 실시간 시세, 개인 일정 등)은 억지로 매칭하지 말고 "
-        "'unsupported_items'에 넣으세요. 일부만 가능하면 가능한 것은 configs에, 없는 것만 unsupported_items에 넣으세요.\n"
-        "5. 요청에 개수('각 2개', '3건' 등)가 있으면 limit와 default_limit에 반영하고, 없으면 문맥에 맞게 3~10 사이로 정하세요."
-    )
-
+    "당신은 RSS 뉴스 수집 요청을 분석해 등록된 RSS 소스 목록과 유연하게 매칭하는 플래너입니다.\n"
+    "제공된 '등록된 RSS 소스 목록'의 키(source_name) 이름과 분야(category)를 보고 "
+    "사용자 요청 의도에 가장 알맞은 소스들을 선택해 유효한 JSON만 출력하세요.\n\n"
+    "출력 스키마:\n"
+    "{\n"
+    '  "default_limit": null,\n'
+    '  "configs": [\n'
+    '    {"source_name": "목록의 정확한 source_name", "category": "카테고리", "limit": null}\n'
+    "  ],\n"
+    '  "unsupported_items": ["목록에 없어 RSS로 제공할 수 없는 요청 항목"]\n'
+    "}\n\n"
+    "판단 원칙:\n"
+    "1. 요청에 '전부', '모두', '전체' 등 제한 없이 피드 내 항목을 가져오려는 의도가 있으면 "
+    "limit와 default_limit을 작은 숫자로 고정하지 말고 null로 판단하세요.\n"
+    "2. 요청에 구체적인 숫자가 있으면 그 개수를 limit와 default_limit에 반영하세요.\n"
+    "3. 개수도 없고 제한 없는 수집 의도도 아닌 일반 요청일 때만 문맥에 맞게 적당한 개수를 정하세요.\n"
+    "4. 특정 분야(예: IT, 경제, 정치, 스포츠 등)나 키워드가 있으면 목록에서 해당 분야/키워드와 관련된 "
+    "source_name과 category를 우선 선택하세요.\n"
+    "5. 등록된 RSS 목록에 없는 주제는 unsupported_items에 넣으세요."
+)
     user_prompt = (
         f"등록된 RSS 소스 목록:\n{catalog_text}\n\n"
         f"사용자 요청: {request_text}"
@@ -228,6 +222,19 @@ def _build_status_message(configs: List[Dict[str, Any]], unsupported_items: List
         return f"일부분({', '.join(unsupported_clean)})은 RSS가 제공하지 않습니다. 가능한 항목만 수집합니다."
     return ""
 
+def _parse_optional_limit(raw_val: Any) -> Optional[int]:
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, int):
+        return raw_val if raw_val > 0 else None
+    if isinstance(raw_val, str):
+        cleaned = raw_val.strip().lower()
+        if not cleaned or cleaned in ("null", "none", "all", "unlimited"):
+            return None
+        if cleaned.isdigit():
+            val = int(cleaned)
+            return val if val > 0 else None
+    return None
 
 def plan_sources_from_request(
     request_text: str,
@@ -281,7 +288,8 @@ def plan_sources_from_request(
         }
 
     explicit_limit = _extract_explicit_limit(request_text)
-    default_limit = explicit_limit if explicit_limit is not None else int(parsed.get("default_limit") or 5)
+    llm_default_limit = _parse_optional_limit(parsed.get("default_limit"))
+    default_limit = explicit_limit if explicit_limit is not None else llm_default_limit
     raw_unsupported = parsed.get("unsupported_items")
     unsupported_items = (
         [str(x).strip() for x in raw_unsupported if str(x).strip()]
@@ -305,17 +313,18 @@ def plan_sources_from_request(
             continue
 
         seen_sources.add(src_name)
+        raw_item_limit = item.get("limit") if "limit" in item else default_limit
         item_limit = (
             explicit_limit
             if explicit_limit is not None
-            else (item.get("limit") if item.get("limit") is not None else default_limit)
+            else _parse_optional_limit(raw_item_limit)
         )
         cfg: Dict[str, Any] = {
             "source_name": src_name,
             "category": str(item.get("category") or base_entry.get("category") or "종합").strip(),
             "rss_urls": urls,
             "storage_mode": effective_mode,
-            "limit": int(item_limit),
+            "limit": item_limit,
         }
         if sqlite_path:
             cfg["sqlite_path"] = sqlite_path

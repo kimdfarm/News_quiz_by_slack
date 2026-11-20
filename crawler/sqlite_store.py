@@ -605,34 +605,49 @@ def delete_perspectives_by_ids_sqlite(
         cur.close()
         conn.close()
 
+def _run_vacuum_and_checkpoint(db_path: str, do_vacuum: bool = True) -> None:
+    if not os.path.exists(db_path):
+        return
+    conn = sqlite3.connect(db_path, timeout=15.0, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        if do_vacuum:
+            conn.execute("VACUUM;")
+    except sqlite3.OperationalError:
+        # 다른 연결이 사용 중이거나 VACUUM 불가 상태여도 삭제 작업 자체는 유지
+        pass
+    finally:
+        conn.close()
+
 
 def delete_old_records_sqlite(
     older_than_iso: str,
     db_path: Optional[str] = None,
 ) -> int:
     """특정 기준 시각 이전의 오래된 데이터를 일부 삭제합니다."""
+    target_path = _resolve_db_path(db_path)
     cutoff = _normalize_dt_str(older_than_iso)
-    conn = get_sqlite_conn(db_path=_resolve_db_path(db_path), read_only=False)
+    conn = get_sqlite_conn(db_path=target_path, read_only=False)
     cur = conn.cursor()
     try:
         cur.execute("DELETE FROM news_perspectives WHERE published_at < ?;", (cutoff,))
-        deleted = cur.rowcount
+        deleted = cur.rowcount or 0
         cur.execute("""
             DELETE FROM news_issues
             WHERE id NOT IN (SELECT DISTINCT issue_id FROM news_perspectives WHERE issue_id IS NOT NULL);
         """)
         conn.commit()
-        if deleted > 0:
-            conn.execute("VACUUM;")
-        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        conn.commit()
-        return deleted
     except Exception:
         conn.rollback()
         raise
     finally:
         cur.close()
         conn.close()
+
+    if deleted > 0:
+        _run_vacuum_and_checkpoint(target_path, do_vacuum=True)
+    return deleted
 
 
 def clear_all_sqlite_data(
@@ -657,18 +672,14 @@ def clear_all_sqlite_data(
     conn = get_sqlite_conn(db_path=target_path, read_only=False)
     cur = conn.cursor()
     try:
-        cur.executescript("""
-            DELETE FROM news_perspectives;
-            DELETE FROM news_issues;
-            DELETE FROM categories;
-            DELETE FROM sources;
-            DELETE FROM sqlite_sequence WHERE name IN ('news_perspectives', 'news_issues', 'categories', 'sources');
-        """)
+        cur.execute("DELETE FROM news_perspectives;")
+        cur.execute("DELETE FROM news_issues;")
+        cur.execute("DELETE FROM categories;")
+        cur.execute("DELETE FROM sources;")
+        cur.execute(
+            "DELETE FROM sqlite_sequence WHERE name IN ('news_perspectives', 'news_issues', 'categories', 'sources');"
+        )
         conn.commit()
-        cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        conn.commit()
-        if vacuum:
-            conn.execute("VACUUM;")
     except Exception:
         conn.rollback()
         raise
@@ -676,6 +687,7 @@ def clear_all_sqlite_data(
         cur.close()
         conn.close()
 
+    _run_vacuum_and_checkpoint(target_path, do_vacuum=vacuum)
 def checkpoint_sqlite(db_path: Optional[str] = None, mode: str = "TRUNCATE") -> None:
     """WAL 변경 사항을 본체 .sqlite 파일에 즉시 반영하고 WAL 파일을 비웁니다."""
     target_path = _resolve_db_path(db_path)
