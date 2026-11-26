@@ -38,7 +38,82 @@ from storage_backend import (
 from tool_rag_router import MCP_TOOL_REGISTRY, retrieve_top_tools
 
 load_dotenv()
+# slack_llm_bot.py 상단에 추가
+from QUIZ.quiz_engine import (
+    QuizProjectDBMS,
+    format_quiz_for_slack,
+    generate_and_save_quiz_with_graph,
+)
 
+_IMPORT_LOCK = threading.Lock()
+_QUIZ_DBMS = QuizProjectDBMS(base_dir=os.path.join(_BASE_DIR, "PROJECT"))
+
+
+def _fetch_articles_for_quiz(keyword: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    raw_res = mcp_tools.get_recent_news_for_quiz(
+        category=keyword or "전체",
+        limit=max(limit, 4),
+        sqlite_path=DEFAULT_SQLITE_PATH,
+    )
+    bundle = json.loads(raw_res) if raw_res else {}
+    articles = list(bundle.get("articles") or [])
+    if keyword and articles:
+        kw_low = keyword.lower()
+        matched = [
+            a
+            for a in articles
+            if kw_low in str(a.get("title") or "").lower()
+            or kw_low in str(a.get("facts") or "").lower()
+            or kw_low in str(a.get("opinion") or "").lower()
+        ]
+        if matched:
+            return matched[:limit]
+    return articles[:limit]
+
+
+def _llm_for_quiz_graph(prompt: str, max_tokens: int) -> Optional[str]:
+    prefer_local = (os.getenv("QUIZ_LLM_PROVIDER") or "").strip().lower() == "ollama"
+    return _invoke_llm_with_fallback(
+        messages=[HumanMessage(content=prompt)],
+        temperature=0.3,
+        max_tokens=max_tokens,
+        prefer_local=prefer_local,
+    )
+
+
+def _grade_thread_submission(quiz_record: Dict[str, Any], user_answer: str, user_id: str) -> str:
+    ls_project = (quiz_record.get("langsmith") or {}).get("project_name")
+    if ls_project:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = ls_project
+
+    prompt = (
+        "당신은 퀴즈 답안 참/거짓 및 루브릭 채점관입니다. JSON으로만 답하세요.\n"
+        f"문제 정보: {json.dumps(quiz_record, ensure_ascii=False)[:2500]}\n"
+        f"제출자(<@{user_id}>) 답안: {user_answer}\n\n"
+        '출력 형식: {"is_true": true, "score_text": "정답/충족", "reason": "판별 이유", "missing": []}'
+    )
+    raw = _invoke_llm_with_fallback(
+        messages=[HumanMessage(content=prompt)],
+        temperature=0.1,
+        max_tokens=500,
+        prefer_local=False,
+    ) or ""
+    cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw, flags=re.IGNORECASE).strip()
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        parsed = json.loads(m.group(0)) if m else {"is_true": False, "reason": raw.strip()}
+
+    verdict_label = "참 (정답/기준 충족)" if parsed.get("is_true") else "거짓 (오답/기준 미충족)"
+    lines = [
+        f"<@{user_id}> 답안 판별: *{verdict_label}* ({parsed.get('score_text', '')})",
+        f"• 근거: {parsed.get('reason', '')}",
+    ]
+    if parsed.get("missing"):
+        lines.append(f"• 보완할 점: {', '.join(str(x) for x in parsed['missing'])}")
+    return "\n".join(lines)
 
 def _resolve_server_path() -> str:
     candidates = [
@@ -1004,32 +1079,84 @@ def handle_mention(event, say, client):
             say(text=f"⚠️ 주기 수집 예약 실패: {e}")
         return
 
-    if tool == "get_recent_news_for_quiz":
-        category = str(chosen.get("category") or "전체")
-        limit = _normalize_positive_int(chosen.get("limit"), default=3) or 3
-        say(text=f"📰 `{category}` 뉴스를 불러와 퀴즈를 만들고 있어요...")
-        raw_res = mcp_tools.get_recent_news_for_quiz(
-            category=category,
+    if tool in ("get_recent_news_for_quiz", "create_quiz_with_template"):
+        chosen = _unwrap_tool_args(chosen)
+        raw_kw = _clean_str_arg(chosen.get("keyword")) or _clean_str_arg(chosen.get("category"))
+        if raw_kw and raw_kw.lower() in ("전체", "일반", "all", "랜덤", "아무거나"):
+            raw_kw = None
+        q_type = _clean_str_arg(chosen.get("question_type"))
+        llm_rule = _clean_str_arg(chosen.get("llm_rule"))
+        raw_rubric = chosen.get("custom_rubric")
+        rubric_list = [str(x) for x in raw_rubric] if isinstance(raw_rubric, list) else None
+        limit = _normalize_positive_int(chosen.get("limit"), default=4) or 4
+
+        say(text="🧠 Top-K 도구 라우팅 및 *LangGraph + LangSmith*로 퀴즈를 생성해 `PROJECT/`에 저장 중이에요...")
+        result = generate_and_save_quiz_with_graph(
+            user_text=user_text,
+            fetch_articles_fn=_fetch_articles_for_quiz,
+            llm_call_fn=_llm_for_quiz_graph,
+            dbms=_QUIZ_DBMS,
+            keyword=raw_kw,
+            question_type=q_type,
+            custom_rubric=rubric_list,
+            llm_rule=llm_rule,
             limit=limit,
-            sqlite_path=DEFAULT_SQLITE_PATH,
         )
-        bundle = json.loads(raw_res)
-        articles = bundle.get("articles") or []
-        news_context = (
-            "\n".join(
-                f"- [{a.get('source') or '언론'}] {a.get('title')} | 사실: {a.get('facts')} | 관점({a.get('stance_type')}): {a.get('opinion')}"
-                for a in articles
+        posted = say(text=format_quiz_for_slack(result))
+        thread_ts = None
+        if isinstance(posted, dict):
+            thread_ts = posted.get("ts") or (posted.get("message") or {}).get("ts")
+        if thread_ts:
+            rec = result["quiz_record"]
+            _QUIZ_DBMS.save_quiz(
+                topic=rec["topic"],
+                quiz_record=rec,
+                thread_ts=thread_ts,
+                channel_id=event.get("channel"),
             )
-            or "(조회된 최근 뉴스가 없습니다.)"
-        )
-        prompt = (
-            f"사용자 요청: {user_text}\n\n"
-            f"참고 뉴스:\n{news_context}\n\n"
-            "위 뉴스를 바탕으로 4지선다형 시사 퀴즈 1문항, 정답, 해설을 만들어주세요."
-        )
-        say(text=ask_llm_for_quiz(prompt))
         return
 
+    if tool == "manage_quiz_project_db":
+        chosen = _unwrap_tool_args(chosen)
+        action = (_clean_str_arg(chosen.get("action")) or "list").lower()
+        topic = _clean_str_arg(chosen.get("topic"))
+        quiz_id = _clean_str_arg(chosen.get("quiz_id"))
+        style = _clean_str_arg(chosen.get("template_style")) or "csat_2col"
+
+        if action == "list":
+            topics = _QUIZ_DBMS.list_topics()
+            if not topics:
+                say(text="📂 `PROJECT/` 폴더에 저장된 문제 파일이 아직 없어요.")
+                return
+            lines = [f"• `{t['file']}` (주제: *{t['topic']}*, {t['count']}문항)" for t in topics]
+            say(text="📂 *PROJECT 퀴즈 DB 목록*\n" + "\n".join(lines))
+            return
+
+        if action == "export":
+            out_path = os.path.join(_BASE_DIR, "PROJECT", f"bundle_{style}.json")
+            saved = _QUIZ_DBMS.export_bundle(
+                export_path=out_path,
+                topics=[topic] if topic else None,
+                template_style=style,
+            )
+            client.files_upload_v2(
+                channel=event.get("channel"),
+                file=saved,
+                filename=os.path.basename(saved),
+                title=os.path.basename(saved),
+                initial_comment=f"📦 문제집 번들(`{style}`)을 디코딩해 추출했어요.",
+            )
+            return
+
+        if action == "delete" and quiz_id:
+            deleted = _QUIZ_DBMS.delete_quiz(quiz_id)
+            say(text=f"🗑️ `{quiz_id}` 삭제 {'완료' if deleted else '대상 없음'}.")
+            return
+
+        items = _QUIZ_DBMS.select_quizzes(topic=topic, quiz_id=quiz_id)
+        say(text=f"🔎 조회 결과 `{len(items)}`건 (`topic={topic or '전체'}`)")
+        return
+    
     if tool == "export_sqlite_file":
         raw_res = mcp_tools.export_sqlite_file(sqlite_path=DEFAULT_SQLITE_PATH)
         info = json.loads(raw_res)
@@ -1267,6 +1394,20 @@ def handle_message_events(event, say):
     attached_files = event.get("files") or []
     if attached_files:
         _process_slack_files(attached_files, say)
+
+# handle_message_events 안쪽, 일반 메시지 처리 전에 추가
+    thread_ts = event.get("thread_ts")
+    if thread_ts and raw_text:
+        matched_quiz = _QUIZ_DBMS.get_by_thread(thread_ts)
+        if matched_quiz:
+            verdict_msg = _grade_thread_submission(
+                quiz_record=matched_quiz,
+                user_answer=raw_text,
+                user_id=event.get("user") or "unknown",
+            )
+            say(text=verdict_msg, thread_ts=thread_ts)
+            return
+    
 
 
 if __name__ == "__main__":

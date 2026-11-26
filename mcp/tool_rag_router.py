@@ -216,6 +216,62 @@ MCP_TOOL_REGISTRY: List[Dict[str, Any]] = [
             "interval_seconds": "실수 또는 정수 (기본 0)",
             "request_text": "수집 대상/건수 요청 문장(예: '경제 뉴스 3개씩 수집')",
         },
+        
+    },
+
+    # tool_rag_router.py 의 MCP_TOOL_REGISTRY 안에 퀴즈 MCP 도구 추가
+    {
+        "tool": "create_quiz_with_template",
+        "group": "content",
+        "intent_tags": ["퀴즈", "문제", "출제", "만들어줘", "내줘", "생성"],
+        "tags": [
+            "비교", "관점", "언론", "논증",
+            "수능", "비문학", "지문", "보기", "세트",
+            "루브릭", "기준", "커스텀", "코칭", "서술형",
+            "팩트체크", "함정", "참거짓", "랜덤", "주제", "키워드",
+        ],
+        "description": (
+            "RAG로 인코딩된 뉴스 데이터를 바탕으로 사용자 요청(또는 랜덤 키워드)에 맞춰 "
+            "4가지 템플릿(multi_perspective: 다각도 언론 비교 서술형, csat_passage_set: 수능/비문학 지문 2~3문항 세트, "
+            "custom_rubric_essay: 커스텀 루브릭 코칭 서술형, fact_check_trap: 팩트체크 함정 판별형) 중 "
+            "최적 유형과 세부 규칙/채점 기준을 LLM이 결정해 문제를 생성하고 PROJECT/<주제>.json에 저장한다."
+        ),
+        "examples": [
+            "반도체 이슈로 수능형 지문 문제 만들어줘",
+            "금리 인상 관련해서 언론사별 관점 비교 서술형 내줘",
+            "핵심 근거 2가지 포함 조건으로 커스텀 서술형 문제 출제해줘",
+            "최근 뉴스 아무거나 골라서 팩트체크 함정 문제 내줘",
+        ],
+        "schema": {
+            "tool": "create_quiz_with_template",
+            "keyword": "사용자 지정 주제/키워드 문자열 | null (요청에 없으면 null로 두어 랜덤/전체 RAG에서 선택)",
+            "question_type": "multi_perspective | csat_passage_set | custom_rubric_essay | fact_check_trap | null",
+            "custom_rubric": ["LLM 또는 사용자가 정한 채점 기준 목록"],
+            "llm_rule": "이번 문제 생성·채점에 적용할 세부 출제/판별 규칙 요약",
+            "limit": "참고할 기사 수 (기본 4)",
+        },
+    },
+    {
+        "tool": "manage_quiz_project_db",
+        "group": "content",
+        "intent_tags": ["문제집", "불러오기", "내보내기", "다운로드", "목록", "조회", "삭제"],
+        "tags": ["project", "json", "퀴즈", "문제", "템플릿", "디코더", "저장소"],
+        "description": (
+            "PROJECT/<주제>.json DBMS에서 생성된 퀴즈/템플릿을 조회(list/get), "
+            "문제집/수능형 번들로 추출·다운로드(export), 또는 외부 JSON을 불러오기(import)/삭제(delete)한다."
+        ),
+        "examples": [
+            "PROJECT에 저장된 퀴즈 주제 목록 보여줘",
+            "반도체 문제 json 다운로드하게 보내줘",
+            "저장된 문제 불러오기 해줘",
+        ],
+        "schema": {
+            "tool": "manage_quiz_project_db",
+            "action": "list | get | export | import | delete",
+            "topic": "주제명 | null",
+            "quiz_id": "퀴즈 ID | null",
+            "template_style": "csat_2col | standard_workbook",
+        },
     },
 ]
 

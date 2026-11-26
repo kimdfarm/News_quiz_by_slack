@@ -712,3 +712,6 @@ def _append_backup_record(record: dict):
             f.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"  [!] 백업 파일 기록 실패: {e}", file=sys.stderr)
+
+
+

@@ -36,6 +36,113 @@ from storage_backend import (
 
 mcp = MCPServer("news-quiz-mcp")
 
+from QUIZ.quiz_engine import (
+    QUIZ_TYPES,
+    QuizProjectDBMS,
+    format_quiz_for_slack,
+    generate_and_save_quiz_with_graph,
+)
+
+_QUIZ_DBMS = QuizProjectDBMS(base_dir=os.path.join(_ROOT_DIR, "PROJECT"))
+
+
+def _server_fetch_articles(keyword: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    path = _resolve_sqlite_target()
+    res = fetch_recent_news(
+        category=keyword or "전체",
+        limit=max(limit, 4),
+        days=7,
+        storage_backend=get_active_storage_backend(),
+        sqlite_path=path,
+    )
+    return list((res or {}).get("articles") or [])[:limit]
+
+
+def _server_llm_call(prompt: str, max_tokens: int = 1500) -> Optional[str]:
+    # news_mcp_server 단독 호출 시에도 동작하도록 slack_llm_bot의 LLM 헬퍼를 지연 로드
+    try:
+        from slack_llm_bot import _invoke_llm_with_fallback
+        from langchain_core.messages import HumanMessage
+
+        out = _invoke_llm_with_fallback(
+            messages=[HumanMessage(content=prompt)],
+            temperature=0.3,
+            max_tokens=max_tokens,
+            prefer_local=False,
+        )
+        return out
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def create_quiz_with_template(
+    keyword: Optional[str] = None,
+    question_type: Optional[str] = None,
+    custom_rubric: Optional[List[str]] = None,
+    llm_rule: Optional[str] = None,
+    limit: int = 4,
+) -> str:
+    """LLM이 결정한 유형/키워드/규칙으로 RAG 기반 퀴즈를 생성하고 PROJECT/<주제>.json에 저장합니다."""
+    q_type = question_type if question_type in QUIZ_TYPES else None
+    user_req = llm_rule or f"주제={keyword or '랜덤'}, 유형={q_type or '자동선택'} 퀴즈 생성"
+    bundle = generate_and_save_quiz_with_graph(
+        user_text=user_req,
+        fetch_articles_fn=_server_fetch_articles,
+        llm_call_fn=_server_llm_call,
+        dbms=_QUIZ_DBMS,
+        keyword=keyword,
+        question_type=q_type,
+        custom_rubric=custom_rubric,
+        llm_rule=llm_rule,
+        limit=limit,
+    )
+    return json.dumps(
+        {
+            "status": "ok",
+            "saved_path": bundle["saved_path"],
+            "ls_project": bundle["ls_project"],
+            "quiz_record": bundle["quiz_record"],
+            "formatted_text": format_quiz_for_slack(bundle),
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def manage_quiz_project_db(
+    action: str = "list",
+    topic: Optional[str] = None,
+    quiz_id: Optional[str] = None,
+    export_path: Optional[str] = None,
+    import_path: Optional[str] = None,
+    template_style: str = "csat_2col",
+) -> str:
+    """PROJECT/<주제>.json DBMS의 조회/추출/불러오기/삭제를 수행합니다."""
+    act = (action or "list").strip().lower()
+    if act == "list":
+        return json.dumps({"status": "ok", "topics": _QUIZ_DBMS.list_topics()}, ensure_ascii=False)
+    if act == "get":
+        items = _QUIZ_DBMS.select_quizzes(topic=topic, quiz_id=quiz_id)
+        return json.dumps({"status": "ok", "count": len(items), "items": items}, ensure_ascii=False)
+    if act == "export":
+        out_file = export_path or os.path.join(_ROOT_DIR, "PROJECT", "_export_workbook.json")
+        saved = _QUIZ_DBMS.export_bundle(
+            export_path=out_file,
+            topics=[topic] if topic else None,
+            template_style=template_style,
+        )
+        return json.dumps({"status": "ok", "export_path": saved}, ensure_ascii=False)
+    if act == "import" and import_path:
+        cnt = _QUIZ_DBMS.import_bundle(import_path)
+        return json.dumps({"status": "ok", "imported_count": cnt}, ensure_ascii=False)
+    if act == "delete" and quiz_id:
+        ok = _QUIZ_DBMS.delete_quiz(quiz_id)
+        return json.dumps({"status": "ok" if ok else "not_found", "deleted": ok}, ensure_ascii=False)
+    return json.dumps({"status": "error", "message": f"지원하지 않는 action: {action}"}, ensure_ascii=False)
+
+
+
 
 def _resolve_sqlite_target(sqlite_path: Optional[str] = None) -> str:
     raw = (sqlite_path or os.getenv("NEWS_SQLITE_PATH") or DEFAULT_SQLITE_PATH).strip()
@@ -429,6 +536,27 @@ def delete_news_records(
         sqlite_path=_resolve_sqlite_target(sqlite_path),
     )
     return json.dumps(result, ensure_ascii=False)
+
+@mcp.tool()
+def get_recent_news_for_quiz(
+    category: str = "경제",
+    limit: int = 3,
+    keyword: Optional[str] = None,
+    storage_backend: Optional[str] = None,
+    sqlite_path: Optional[str] = None,
+) -> str:
+    """최근 뉴스 데이터를 조회합니다."""
+    path = _resolve_sqlite_target(sqlite_path)
+    effective_cat = keyword.strip() if (keyword and keyword.strip()) else category
+    result = fetch_recent_news(
+        category=effective_cat,
+        limit=limit,
+        days=7,
+        storage_backend=storage_backend,
+        sqlite_path=path,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
 
 
 
