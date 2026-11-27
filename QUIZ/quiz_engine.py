@@ -246,17 +246,20 @@ class QuizGenState(TypedDict):
     relevance_ok: bool
     rag_feedback: str
     rag_retry_count: int
+    design_plan: Dict[str, Any]
+    source_display_limit: int
     draft_quiz: Dict[str, Any]
     quality_report: Dict[str, Any]
     retry_count: int
     ls_project: str
 
 
-def _articles_to_context(articles: List[Dict[str, Any]]) -> str:
+def _articles_to_context(articles: List[Dict[str, Any]], max_items: Optional[int] = None) -> str:
     if not articles:
         return "(저장된 기사 데이터 중 요청 주제와 직접 일치하는 기사가 부족합니다.)"
+    sliced = articles[:max_items] if max_items and max_items > 0 else articles
     lines = []
-    for i, a in enumerate(articles[:6], 1):
+    for i, a in enumerate(sliced, 1):
         lines.append(
             f"[{i}] ({a.get('source') or a.get('press') or '언론'}) {a.get('title') or ''}\n"
             f"    사실: {a.get('facts') or a.get('summary') or a.get('content') or ''}\n"
@@ -272,7 +275,6 @@ def _infer_type_with_llm(
 ) -> str:
     available = load_all_quiz_types()
     if requested_type and requested_type in available:
-        # 사용자가 명시적으로 "서술형"을 요구했는데 객관식 유형이 들어온 경우 보정
         if "서술형" in user_text and available[requested_type].get("allow_choices"):
             return "multi_perspective" if "multi_perspective" in available else requested_type
         return requested_type
@@ -322,10 +324,9 @@ def generate_and_save_quiz_with_graph(
 
     def node_fetch_rag(state: QuizGenState) -> Dict[str, Any]:
         query = state.get("rag_query") or state.get("keyword")
-        # 후보군을 넉넉히 조회해서 LangGraph가 정밀 필터링하도록 전달
-        articles = fetch_articles_fn(query, max(limit * 3, 12))
+        articles = fetch_articles_fn(query, max(limit * 3, 15))
         if not articles and query:
-            articles = fetch_articles_fn(None, max(limit * 3, 12))
+            articles = fetch_articles_fn(None, max(limit * 3, 15))
         return {"articles": articles}
 
     def node_judge_relevance(state: QuizGenState) -> Dict[str, Any]:
@@ -340,9 +341,8 @@ def generate_and_save_quiz_with_graph(
                 "rag_feedback": "DB에서 조회된 기사가 없습니다.",
             }
 
-        # 특정 키워드/주제 지정이 없으면 바로 통과
         if not target_topic:
-            picked = articles[:limit]
+            picked = articles[: max(limit * 2, 6)]
             titles = [str(a.get("title") or "") for a in picked if a.get("title")]
             words = [
                 w
@@ -391,7 +391,7 @@ def generate_and_save_quiz_with_graph(
 
         if filtered:
             return {
-                "articles": filtered[:limit],
+                "articles": filtered,
                 "relevance_ok": True,
                 "rag_feedback": "",
             }
@@ -409,7 +409,6 @@ def generate_and_save_quiz_with_graph(
         prompt = (
             "이전 RAG 검색에서 요청 주제와 맞는 기사를 찾지 못했습니다.\n"
             "DB에서 관련 기사를 정밀하게 찾기 위한 대체 핵심 검색어(1단어 또는 짧은 키워드) 1개를 제안하세요.\n"
-            "예: 'AI' -> '인공지능', 'LLM', '생성형', '반도체'\n"
             'JSON만 출력: {"next_query": "대체검색어"}\n\n'
             f"원래 주제: {state.get('keyword')}\n"
             f"이전 검색어: {prev_q}\n"
@@ -421,39 +420,102 @@ def generate_and_save_quiz_with_graph(
 
     def route_after_relevance(state: QuizGenState) -> str:
         if state.get("relevance_ok"):
-            return "generate"
+            return "plan_design"
         if int(state.get("rag_retry_count") or 0) >= 2:
-            return "generate"
+            return "plan_design"
         return "rewrite_rag"
+
+    def node_plan_design(state: QuizGenState) -> Dict[str, Any]:
+        """문항 설계 방향과 반영할 기사 수를 LangGraph가 동적으로 결정합니다."""
+        articles = state.get("articles") or []
+        q_type = state.get("question_type") or resolved_type
+        spec = get_quiz_type_spec(q_type)
+        is_essay = bool(spec.get("is_essay")) or (not bool(spec.get("allow_choices"))) or ("서술형" in state["user_text"])
+        avail_cnt = len(articles)
+
+        titles_preview = [
+            f"{i+1}. [{a.get('source') or a.get('press') or '언론'}] {a.get('title') or ''}"
+            for i, a in enumerate(articles[:8])
+        ]
+        prompt = (
+            "당신은 출제 전략을 설계하는 LangGraph 설계자입니다.\n"
+            "확보된 기사 수와 문제 유형을 보고, 이번 문제에 몇 개의 기사를 반영할지(display_article_count)와 "
+            "출제 각도(angle)를 지능적으로 결정하세요.\n"
+            "규칙:\n"
+            f"1. 확보된 기사 수는 {avail_cnt}개입니다. display_article_count는 1 이상 {max(1, min(avail_cnt, 8))} 이하 정수로 정하세요.\n"
+            "2. 단순 팩트 1개만 깊이 파는 문제면 1~2개, 복수 관점 비교·다각도 논증·종합 분석이면 3~6개처럼 "
+            "4개 고정에 얽매이지 말고 출제 목적에 맞게 적게 또는 많게 정하세요.\n"
+            "3. 서술형(is_essay=true)일 경우 '지문 요약해라' 같은 밋밋한 지시가 아니라 "
+            "상반된 시각/쟁점 비교, 한계점 비판, 정책·대응 방향 논증 등 사고력을 요구하는 출제 각도를 잡으세요.\n"
+            'JSON만 출력: {"display_article_count": 3, "angle": "출제 각도 설명", "reasoning": "선택 이유"}\n\n'
+            f"주제: {state.get('keyword')}\n"
+            f"유형: {q_type} (is_essay={is_essay})\n"
+            f"사용자 요청: {state['user_text']}\n"
+            f"확보된 기사 목록:\n" + ("\n".join(titles_preview) if titles_preview else "(없음)")
+        )
+        parsed = _extract_json_obj(llm_call_fn(prompt, 250) or "") or {}
+        max_allowed = max(1, min(avail_cnt if avail_cnt > 0 else 1, 8))
+        raw_cnt = parsed.get("display_article_count")
+        try:
+            chosen_cnt = int(raw_cnt)
+        except Exception:
+            chosen_cnt = min(max_allowed, 2 if is_essay else 3)
+        chosen_cnt = max(1, min(chosen_cnt, max_allowed))
+
+        plan = {
+            "is_essay": is_essay,
+            "display_article_count": chosen_cnt,
+            "angle": str(parsed.get("angle") or (
+                "핵심 쟁점과 상반된 관점·한계점을 비교하며 논거를 제시하도록 출제"
+                if is_essay
+                else "제시된 기사 근거를 바탕으로 핵심 원리와 적용 사례를 분석하도록 출제"
+            )),
+            "reasoning": str(parsed.get("reasoning") or "문항 성격과 확보 기사 수에 맞춰 동적 산정"),
+        }
+        return {
+            "design_plan": plan,
+            "source_display_limit": chosen_cnt,
+            "articles": articles[:chosen_cnt] if articles else [],
+        }
 
     def node_generate(state: QuizGenState) -> Dict[str, Any]:
         articles = state.get("articles") or []
-        ctx = _articles_to_context(articles)
+        disp_limit = int(state.get("source_display_limit") or len(articles) or 1)
+        ctx = _articles_to_context(articles, max_items=disp_limit)
         q_type = state["question_type"] or resolved_type
         spec = get_quiz_type_spec(q_type)
-        allow_choices = bool(spec.get("allow_choices")) and ("서술형" not in state["user_text"])
+        plan = state.get("design_plan") or {}
+        is_essay = bool(plan.get("is_essay")) or ("서술형" in state["user_text"])
+        allow_choices = bool(spec.get("allow_choices")) and not is_essay
 
         prev_feedback = (state.get("quality_report") or {}).get("feedback") or ""
         rag_warn = state.get("rag_feedback") or ""
         extra_rule = state.get("llm_rule") or ""
         rubric_list = state.get("custom_rubric") or [
-            "핵심 쟁점 또는 근거를 정확히 제시했는가",
+            "핵심 쟁점과 근거를 정확히 제시했는가",
             "기사 사실과 모순되는 주장이 없는가",
+            "주장·비교·판단의 논리적 일관성이 있는가",
         ]
         type_guide = spec["build_guide"](rubric_list)
-        format_rule = (
-            "객관식 문항이므로 choices 배열에 4~5개 선택지를 반드시 포함하세요."
-            if allow_choices
-            else "서술형/주관식 문항이므로 choices는 반드시 빈 배열([])로 출력하고 객관식 선지를 절대 생성하지 마세요."
-        )
+
+        if is_essay:
+            format_rule = (
+                "서술형 문항입니다. choices는 반드시 빈 배열([])로 두고 선택지(①, ②, ③, ④)를 절대 만들지 마세요. "
+                "또한 단순 암기·단순 요약형('~을 요약하시오' 수준)을 피하고, "
+                "두 가지 이상의 관점/쟁점 대조, 원인과 한계의 비판적 분석, 또는 구체적 근거를 요구하는 "
+                "모순 없는 논증형 서술 문항으로 출제하세요."
+            )
+        else:
+            format_rule = "객관식 문항이므로 choices 배열에 4~5개 선택지를 반드시 포함하세요."
 
         prompt = (
             f"주제 키워드: {state['keyword']}\n"
             f"문제 유형: {q_type} ({spec.get('label', q_type)})\n"
             f"사용자 요청: {state['user_text']}\n"
+            f"LangGraph 출제 설계 방향: {plan.get('angle', '')}\n"
             + (f"최종 판별/출제 규칙: {extra_rule}\n" if extra_rule else "")
             + (f"이미 PROJECT에 생성된 문제 목록(가능하면 겹치지 않게 출제):\n{state.get('existing_ctx', '')}\n" if state.get("existing_ctx") else "")
-            + f"참고 기사:\n{ctx}\n\n"
+            + f"참고 기사 ({disp_limit}건 반영):\n{ctx}\n\n"
             f"출제 지침: {type_guide}\n"
             f"형식 강제 규칙: {format_rule}\n"
             "중요: 참고 기사에 없는 내용을 억지로 기사 보도인 것처럼 지어내지 마세요.\n"
@@ -462,9 +524,9 @@ def generate_and_save_quiz_with_graph(
             + "\n반드시 아래 JSON 형식으로만 출력하세요:\n"
             "{\n"
             '  "title": "문제 세트 제목",\n'
-            '  "passage": "지문 또는 상황 설명(구체적 기사 요약·발췌 포함)",\n'
+            '  "passage": "문제 풀이에 필요한 배경 지문 또는 상황 설명",\n'
             '  "source_excerpts": [\n'
-            '    {"source": "언론사/제목", "summary": "사용자가 답을 도출할 수 있는 핵심 사실·관점 요약"}\n'
+            '    {"source": "언론사/제목", "summary": "핵심 사실·관점 요약"}\n'
             "  ],\n"
             '  "questions": [\n'
             '    {"number": 1, "stem": "문항", "box_example": null, "choices": [], "answer": "정답/핵심요지", "explanation": "해설"}\n'
@@ -477,31 +539,37 @@ def generate_and_save_quiz_with_graph(
         parsed = _extract_json_obj(raw)
         if not parsed:
             parsed = {
-                "title": f"{state['keyword']} 퀴즈",
+                "title": f"{state['keyword']} 분석 과제",
                 "passage": ctx[:800],
                 "questions": [
                     {
                         "number": 1,
-                        "stem": raw.strip() or f"{state['keyword']} 핵심 내용을 서술하세요.",
+                        "stem": raw.strip() or f"{state['keyword']} 관련 주요 쟁점의 차이와 한계를 서술하세요.",
                         "box_example": None,
                         "choices": [],
-                        "answer": "참고 기사의 핵심 쟁점 반영",
+                        "answer": "참고 기사의 핵심 쟁점 및 근거 반영",
                         "explanation": "기사 본문 근거 확인",
                     }
                 ],
                 "rubric": rubric_list,
             }
 
-        # 서술형일 경우 모델이 실수로 넣은 choices 원천 제거
         if not allow_choices:
             for q in parsed.get("questions") or []:
                 if isinstance(q, dict):
                     q["choices"] = []
 
+        excerpts = parsed.get("source_excerpts") or []
+        if isinstance(excerpts, list) and len(excerpts) > disp_limit:
+            parsed["source_excerpts"] = excerpts[:disp_limit]
+
         quiz_id = f"quiz_{uuid.uuid4().hex[:10]}"
         parsed["quiz_id"] = quiz_id
         parsed["topic"] = state["keyword"]
         parsed["question_type"] = q_type
+        parsed["is_essay"] = is_essay
+        parsed["source_display_limit"] = disp_limit
+        parsed["design_plan"] = plan
         parsed["llm_rule"] = extra_rule
         parsed["source_count"] = len(articles)
         parsed["rag_relevance_ok"] = bool(state.get("relevance_ok"))
@@ -513,7 +581,6 @@ def generate_and_save_quiz_with_graph(
         quiz = state["draft_quiz"]
         spec = get_quiz_type_spec(quiz.get("question_type") or resolved_type)
 
-        # 1단계: 유형 플러그인의 구조적 검증 규칙 실행
         plugin_ok, plugin_msg = spec["validate"](quiz)
         if not plugin_ok:
             return {
@@ -521,12 +588,21 @@ def generate_and_save_quiz_with_graph(
                 "retry_count": state.get("retry_count", 0) + 1,
             }
 
-        # 2단계: LLM 품질/주제 정합성 평가
+        # 서술형 문항의 내부 모순(객관식 유도 표현, 지문과 불일치, 모호한 요구) 점검
+        sanitized_for_judge = {
+            k: v
+            for k, v in quiz.items()
+            if k not in ("source_excerpts", "rubric")
+        }
         judge_prompt = (
-            "다음 퀴즈 초안의 품질을 0.0~1.0 점수로 평가하고 JSON으로만 답하세요.\n"
-            f"요청 주제: {state['keyword']} | 요청 유형: {quiz.get('question_type')} | 사용자 원문: {state['user_text']}\n"
-            "평가 기준: 요청 주제 일치 여부, 문항 형식 일치(서술형/객관식), 정답/해설/루브릭 존재 여부.\n"
-            f"퀴즈 JSON:\n{json.dumps(quiz, ensure_ascii=False)[:2500]}\n\n"
+            "당신은 문항 논리 모순과 품질을 검증하는 심사관입니다. 0.0~1.0 점수와 판정을 JSON으로만 답하세요.\n"
+            f"요청 주제: {state['keyword']} | 유형: {quiz.get('question_type')} | is_essay: {quiz.get('is_essay')}\n"
+            f"사용자 원문: {state['user_text']}\n"
+            "검증 항목:\n"
+            "1. 서술형(is_essay=true)인데 선지형/객관식 문항처럼 구성되었거나 지문과 모순되는 점이 없는가?\n"
+            "2. 문제 지문과 문항 요구사항이 서로 논리적으로 맞물리는가?\n"
+            "3. 정답(answer)과 해설(explanation)이 문항에 대응하는가?\n"
+            f"검증 대상 JSON:\n{json.dumps(sanitized_for_judge, ensure_ascii=False)[:2500]}\n\n"
             '출력 형식: {"passed": true, "score": 0.9, "feedback": "개선점 또는 양호"}'
         )
         raw = llm_call_fn(judge_prompt, 300) or ""
@@ -556,6 +632,7 @@ def generate_and_save_quiz_with_graph(
     graph.add_node("fetch_rag", node_fetch_rag)
     graph.add_node("judge_relevance", node_judge_relevance)
     graph.add_node("rewrite_rag_query", node_rewrite_rag_query)
+    graph.add_node("plan_design", node_plan_design)
     graph.add_node("generate", node_generate)
     graph.add_node("verify", node_verify)
 
@@ -564,9 +641,10 @@ def generate_and_save_quiz_with_graph(
     graph.add_conditional_edges(
         "judge_relevance",
         route_after_relevance,
-        {"rewrite_rag": "rewrite_rag_query", "generate": "generate"},
+        {"rewrite_rag": "rewrite_rag_query", "plan_design": "plan_design"},
     )
     graph.add_edge("rewrite_rag_query", "fetch_rag")
+    graph.add_edge("plan_design", "generate")
     graph.add_edge("generate", "verify")
     graph.add_conditional_edges("verify", route_after_verify, {"retry": "generate", "done": END})
     compiled = graph.compile()
@@ -583,6 +661,8 @@ def generate_and_save_quiz_with_graph(
         "relevance_ok": False,
         "rag_feedback": "",
         "rag_retry_count": 0,
+        "design_plan": {},
+        "source_display_limit": max(1, limit),
         "draft_quiz": {},
         "quality_report": {},
         "retry_count": 0,
@@ -621,10 +701,18 @@ def generate_and_save_quiz_with_graph(
     }
 
 
-def format_quiz_for_slack(result: Dict[str, Any], articles: Optional[List[Dict[str, Any]]] = None) -> str:
+def format_quiz_for_slack(
+    result: Dict[str, Any],
+    articles: Optional[List[Dict[str, Any]]] = None,
+    show_sources: bool = False,
+    show_rubric: bool = False,
+) -> str:
+    """초기 출제 시에는 참고 기사 자료와 채점 기준을 숨기고, 요청 시에만 표시합니다."""
     rec = result["quiz_record"]
     spec = get_quiz_type_spec(rec.get("question_type") or "")
     q_report = rec.get("quality_report") or {}
+    disp_limit = int(rec.get("source_display_limit") or len(rec.get("source_excerpts") or []) or 1)
+    allow_choices = bool(spec.get("allow_choices")) and not bool(rec.get("is_essay"))
 
     lines = [
         f"📝 *[퀴즈 생성 완료]* `{rec.get('topic')}` | 유형: `{rec.get('question_type')}` ({spec.get('label', '')})",
@@ -637,33 +725,330 @@ def format_quiz_for_slack(result: Dict[str, Any], articles: Optional[List[Dict[s
     if rec.get("passage"):
         lines.append(f"> {rec['passage']}")
 
-    excerpts = rec.get("source_excerpts") or []
-    if excerpts:
-        lines.append("\n*참고 기사 자료*")
-        for ex in excerpts[:4]:
-            src = ex.get("source") or "기사"
-            summ = ex.get("summary") or ""
-            lines.append(f"• *{src}*: {summ}")
-    elif articles:
-        lines.append("\n*참고 기사 자료*")
-        for a in articles[:4]:
-            title = a.get("title") or "제목 없음"
-            body = (a.get("facts") or a.get("summary") or a.get("content") or a.get("opinion") or "").strip()
-            lines.append(f"• *{title}*: {body[:180]}")
+    if show_sources:
+        excerpts = rec.get("source_excerpts") or []
+        if excerpts:
+            lines.append("\n*참고 기사 자료*")
+            for ex in excerpts[:disp_limit]:
+                src = ex.get("source") or "기사"
+                summ = ex.get("summary") or ""
+                lines.append(f"• *{src}*: {summ}")
+        elif articles:
+            lines.append("\n*참고 기사 자료*")
+            for a in articles[:disp_limit]:
+                title = a.get("title") or "제목 없음"
+                body = (a.get("facts") or a.get("summary") or a.get("content") or a.get("opinion") or "").strip()
+                lines.append(f"• *{title}*: {body[:180]}")
 
     lines.append("")
     for q in rec.get("questions") or []:
         lines.append(f"*Q{q.get('number', '')}.* {q.get('stem', '')}")
         if q.get("box_example"):
             lines.append(f"```<보기>\n{q['box_example']}\n```")
-        if spec.get("allow_choices"):
+        if allow_choices:
             for ch in q.get("choices") or []:
                 lines.append(f"  {ch}")
 
-    if rec.get("rubric"):
+    if show_rubric and rec.get("rubric"):
         lines.append("\n*채점 기준*")
         for r in rec["rubric"]:
             lines.append(f"• {r}")
 
-    lines.append("\n_위 참고 기사 자료를 바탕으로 이 메시지의 스레드에 답안을 남겨주시면 참·거짓/루브릭으로 판별해 드릴게요._")
+    lines.append(
+        "\n_이 메시지의 스레드에 답안을 남겨주시면 참·거짓/루브릭으로 판별해 드릴게요. "
+        "(참고 기사나 채점 기준이 필요하시면 스레드에 요청해 주세요.)_"
+    )
     return "\n".join(lines)
+
+def regenerate_quiz_from_record(
+    source_quiz: Dict[str, Any],
+    user_text: str,
+    llm_call_fn: Callable[[str, int], Optional[str]],
+    dbms: QuizProjectDBMS,
+    target_format: Optional[str] = None,  # "essay" | "multiple_choice" | None(자동 판별)
+    question_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """기존 퀴즈 레코드를 바탕으로 새 형식(객관식/서술형)의 독립 퀴즈 1문항을 생성·저장합니다."""
+    topic = source_quiz.get("topic") or "general"
+    topic_label = sanitize_topic_filename(topic)
+    ls_project = (source_quiz.get("langsmith") or {}).get("project_name") or f"quiz-{topic_label}-{uuid.uuid4().hex[:4]}"
+
+    want_essay = target_format == "essay" or (
+        target_format is None and ("서술형" in user_text or "주관식" in user_text)
+    )
+    want_mc = target_format == "multiple_choice" or (
+        target_format is None and ("객관식" in user_text or "선지" in user_text)
+    )
+
+    if want_essay:
+        resolved_type = question_type or "custom_rubric_essay"
+        allow_choices = False
+    elif want_mc:
+        resolved_type = question_type or "csat_passage_set"
+        allow_choices = True
+    else:
+        resolved_type = question_type or source_quiz.get("question_type") or "custom_rubric_essay"
+        spec = get_quiz_type_spec(resolved_type)
+        allow_choices = bool(spec.get("allow_choices"))
+
+    source_summary = {
+        "title": source_quiz.get("title"),
+        "passage": source_quiz.get("passage"),
+        "questions": source_quiz.get("questions"),
+        "source_excerpts": source_quiz.get("source_excerpts"),
+        "rubric": source_quiz.get("rubric"),
+    }
+
+    format_instruction = (
+        "반드시 서술형 1문항으로 재탄생시키세요. choices는 반드시 빈 배열([])로 두고 객관식 선지를 절대 만들지 마세요."
+        if not allow_choices
+        else "반드시 객관식 1문항으로 재탄생시키세요. choices에 4개 선택지를 넣고 정답과 해설을 명확히 작성하세요."
+    )
+
+    prompt = (
+        "기존 문제를 바탕으로 새로운 관점/형식의 퀴즈 1문항으로 재탄생시키세요. JSON만 출력하세요.\n"
+        f"주제: {topic}\n"
+        f"사용자 요청: {user_text}\n"
+        f"형식 지침: {format_instruction}\n"
+        f"기존 문제 데이터:\n{json.dumps(source_summary, ensure_ascii=False)[:2500]}\n\n"
+        "출력 JSON 형식:\n"
+        "{\n"
+        '  "title": "새 문제 제목",\n'
+        '  "passage": "지문 또는 상황 설명",\n'
+        '  "source_excerpts": [],\n'
+        '  "questions": [\n'
+        '    {"number": 1, "stem": "새 문항", "box_example": null, "choices": [], "answer": "정답/핵심요지", "explanation": "해설"}\n'
+        "  ],\n"
+        '  "rubric": ["채점 기준 1", "채점 기준 2"]\n'
+        "}"
+    )
+
+    raw = llm_call_fn(prompt, 1500) or ""
+    parsed = _extract_json_obj(raw) or {
+        "title": f"{topic} 재구성 문항",
+        "passage": source_quiz.get("passage") or "",
+        "source_excerpts": source_quiz.get("source_excerpts") or [],
+        "questions": [
+            {
+                "number": 1,
+                "stem": f"{topic}의 핵심 쟁점과 근거를 논리적으로 서술하세요.",
+                "box_example": None,
+                "choices": [],
+                "answer": "핵심 쟁점과 타당한 근거 제시",
+                "explanation": "기존 문제의 쟁점과 근거를 바탕으로 재구성",
+            }
+        ],
+        "rubric": source_quiz.get("rubric") or ["핵심 근거의 정확성", "논리적 일관성"],
+    }
+
+    if not allow_choices:
+        for q in parsed.get("questions") or []:
+            if isinstance(q, dict):
+                q["choices"] = []
+
+    new_quiz_id = f"quiz_{uuid.uuid4().hex[:10]}"
+    parsed["quiz_id"] = new_quiz_id
+    parsed["topic"] = topic
+    parsed["question_type"] = resolved_type
+    parsed["is_essay"] = not allow_choices
+    parsed["source_display_limit"] = int(source_quiz.get("source_display_limit") or len(parsed.get("source_excerpts") or []) or 1)
+    parsed["derived_from"] = {
+        "quiz_id": source_quiz.get("quiz_id"),
+        "topic": topic,
+        "title": source_quiz.get("title"),
+    }
+    parsed["quality_report"] = {"passed": True, "score": 0.9, "feedback": "기존 문제 기반 재탄생"}
+    parsed["langsmith"] = {"project_name": ls_project, "attempts": 1}
+
+    saved_path = dbms.save_quiz(topic=topic, quiz_record=parsed)
+    return {
+        "quiz_record": parsed,
+        "saved_path": saved_path,
+        "ls_project": ls_project,
+        "articles": [],
+    }
+
+CIRCLE_NUMS = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
+
+
+def parse_n_m_from_text(
+    user_text: str,
+    default_n: int = 5,
+    default_m: int = 1,
+) -> tuple[int, int]:
+    """자연어에서 N지선다(N)와 M개 정답(M)을 추출합니다. (기본 N=5, M=1)"""
+    txt = user_text or ""
+    n_val = default_n
+    m_val = default_m
+
+    m_n = re.search(r"(\d{1,2})\s*지\s*선\s*다", txt)
+    if m_n:
+        n_val = int(m_n.group(1))
+
+    m_ans = re.search(r"(?:정답\s*(\d{1,2})\s*개|(\d{1,2})\s*개\s*정답|복수\s*정답\s*(\d{1,2})?)", txt)
+    if m_ans:
+        raw_m = m_ans.group(1) or m_ans.group(2) or m_ans.group(3)
+        if raw_m:
+            m_val = int(raw_m)
+        else:
+            m_val = max(2, default_m)
+    elif any(k in txt for k in ("복수정답", "복수 정답", "다중정답", "다중 정답", "여러 개 정답", "모두 고르")):
+        m_val = max(2, default_m)
+
+    n_val = max(2, min(n_val, len(CIRCLE_NUMS)))
+    m_val = max(1, min(m_val, n_val - 1))
+    return n_val, m_val
+
+
+def _normalize_choices_n(raw_choices: List[Any], n_choices: int) -> List[str]:
+    """선지 개수를 N개로 맞추고 ①~⑩ 번호를 통일합니다."""
+    items = list(raw_choices or [])[:n_choices]
+    while len(items) < n_choices:
+        items.append(f"지문 내용과 다른 오답 선택지 {len(items) + 1}")
+
+    normalized: List[str] = []
+    for idx, ch in enumerate(items):
+        text = str(ch or "").strip()
+        text = re.sub(r"^(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d+[\.\)\:]|\(\d+\))\s*", "", text).strip()
+        prefix = CIRCLE_NUMS[idx] if idx < len(CIRCLE_NUMS) else f"{idx + 1}."
+        normalized.append(f"{prefix} {text}")
+    return normalized
+
+
+def _normalize_single_question_record(
+    parsed: Dict[str, Any],
+    allow_choices: bool,
+    num_choices: int = 5,
+    num_correct: int = 1,
+) -> Dict[str, Any]:
+    """1문항 고정 + N지선다 선지 정규화 + M개 정답 인덱스(answer_indices) 확정"""
+    questions = parsed.get("questions") or []
+    first_q = dict(questions[0]) if questions and isinstance(questions[0], dict) else {
+        "number": 1,
+        "stem": "제시된 내용을 바탕으로 알맞은 것을 고르세요.",
+        "box_example": None,
+        "choices": [],
+        "answer_indices": [],
+        "answer": "",
+        "explanation": "",
+    }
+    first_q["number"] = 1
+
+    if allow_choices:
+        n_cnt = max(2, min(int(num_choices or 5), len(CIRCLE_NUMS)))
+        m_cnt = max(1, min(int(num_correct or 1), n_cnt - 1))
+        norm_choices = _normalize_choices_n(first_q.get("choices") or [], n_choices=n_cnt)
+        first_q["choices"] = norm_choices
+        first_q["num_choices"] = n_cnt
+        first_q["num_correct"] = m_cnt
+
+        ans_indices: List[int] = []
+        raw_indices = first_q.get("answer_indices")
+        if isinstance(raw_indices, list):
+            for x in raw_indices:
+                try:
+                    xi = int(x)
+                    if 1 <= xi <= n_cnt and xi not in ans_indices:
+                        ans_indices.append(xi)
+                except Exception:
+                    continue
+
+        if not ans_indices:
+            raw_ans = str(first_q.get("answer") or "")
+            for i, sym in enumerate(CIRCLE_NUMS[:n_cnt], 1):
+                if sym in raw_ans or re.search(rf"(?:^|[^\d]){i}(?:번|[^\d]|$)", raw_ans):
+                    if i not in ans_indices:
+                        ans_indices.append(i)
+
+        for fallback_i in range(1, n_cnt + 1):
+            if len(ans_indices) >= m_cnt:
+                break
+            if fallback_i not in ans_indices:
+                ans_indices.append(fallback_i)
+
+        ans_indices = sorted(ans_indices[:m_cnt])
+        first_q["answer_indices"] = ans_indices
+        first_q["answer_index"] = ans_indices[0] if ans_indices else 1
+        first_q["answer"] = ", ".join(norm_choices[i - 1] for i in ans_indices)
+    else:
+        first_q["choices"] = []
+        first_q["answer_indices"] = []
+        first_q["answer_index"] = None
+
+    parsed["questions"] = [first_q]
+    return parsed
+
+def build_quiz_slack_blocks(
+    result: Dict[str, Any],
+    show_sources: bool = False,
+    show_rubric: bool = False,
+) -> List[Dict[str, Any]]:
+    rec = result["quiz_record"]
+    spec = get_quiz_type_spec(rec.get("question_type") or "")
+    allow_choices = bool(spec.get("allow_choices")) and not bool(rec.get("is_essay"))
+    q = (rec.get("questions") or [{}])[0]
+    choices = q.get("choices") or []
+    m_cnt = int(q.get("num_correct") or len(q.get("answer_indices") or []) or 1)
+    n_cnt = len(choices)
+
+    header_text = format_quiz_for_slack(
+        result,
+        articles=result.get("articles"),
+        show_sources=show_sources,
+        show_rubric=show_rubric,
+    )
+
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": header_text[:2900]},
+        }
+    ]
+
+    if allow_choices and choices:
+        quiz_id = rec["quiz_id"]
+        options = [
+            {
+                "text": {"type": "plain_text", "text": ch[:75], "emoji": True},
+                "value": f"{idx}|{ch[:60]}",
+            }
+            for idx, ch in enumerate(choices, 1)
+        ]
+        is_multi = m_cnt > 1
+        accessory_type = "checkboxes" if is_multi else "radio_buttons"
+        guide_label = (
+            f"*답안 선택 ({n_cnt}지선다 · *{m_cnt}개* 선택 후 제출)*"
+            if is_multi
+            else f"*답안 선택 ({n_cnt}지선다 · *{m_cnt}개* 선택 후 제출)*"
+        )
+
+        blocks.extend([
+            {"type": "divider"},
+            {
+                "type": "section",
+                "block_id": f"quiz_select_block_{quiz_id}",
+                "text": {"type": "mrkdwn", "text": guide_label},
+                "accessory": {
+                    "type": accessory_type,
+                    "action_id": "quiz_choice_select",
+                    "options": options,
+                },
+            },
+            {
+                "type": "actions",
+                "block_id": f"quiz_submit_block_{quiz_id}",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ 답안 제출하기", "emoji": True},
+                        "style": "primary",
+                        "action_id": "quiz_choice_submit",
+                        "value": quiz_id,
+                    }
+                ],
+            },
+        ])
+
+    return blocks
+
+

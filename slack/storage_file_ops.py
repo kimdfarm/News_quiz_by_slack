@@ -167,7 +167,10 @@ def handle_storage_action(
         return
 
     if tool == "get_storage_stats":
-        target_backend = resolve_backend_value_with_llm(chosen.get("target_backend"), user_text=user_text)
+        raw_backend = resolve_backend_value_with_llm(chosen.get("target_backend"), user_text=user_text)
+        explicit_keywords = ("sqlite", "파일", "로컬", "postgres", "postgresql", "neon", "네온")
+        has_explicit_backend = any(k in (user_text or "").lower() for k in explicit_keywords)
+        target_backend = raw_backend if has_explicit_backend else None
         data = json.loads(
             mcp_tools.get_storage_stats(
                 target_backend=target_backend,

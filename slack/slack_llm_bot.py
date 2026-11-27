@@ -21,6 +21,7 @@ from slack.llm_router import choose_mcp_tool
 from slack.quiz_handler import (
     handle_quiz_db_manage,
     handle_quiz_generate,
+    handle_quiz_ui_submit,
     try_handle_quiz_thread_reply,
 )
 from slack.schedule_worker import (
@@ -33,7 +34,6 @@ from slack.schedule_worker import (
 from slack.storage_file_ops import handle_storage_action, process_slack_files
 from sqlite_store import init_sqlite_db
 from storage_backend import DEFAULT_SQLITE_PATH, get_active_storage_backend
-
 load_dotenv()
 
 
@@ -145,6 +145,17 @@ def handle_mention(event, say, client):
         client=client,
         mcp_tools=mcp_tools,
     )
+
+@app.action("quiz_choice_select")
+def handle_quiz_radio_select(ack):
+    ack()
+
+
+@app.action("quiz_choice_submit")
+def handle_quiz_submit_button(ack, body, client):
+    ack()
+    handle_quiz_ui_submit(body=body, client=client)
+
 
 
 @app.event("message")
