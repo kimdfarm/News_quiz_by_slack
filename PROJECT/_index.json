@@ -1,4 +1,23 @@
 {
   "threads": {},
-  "quizzes": {}
+  "quizzes": {
+    "quiz_5e169b7b13": {
+      "topic": "언론 관점 비교",
+      "file": "언론_관점_비교.json",
+      "question_type": "multi_perspective",
+      "langsmith_project": "quiz-언론_관점_비교-f2f0"
+    },
+    "quiz_78eecfe5e1": {
+      "topic": "AI",
+      "file": "AI.json",
+      "question_type": "multi_perspective",
+      "langsmith_project": "quiz-AI-6422"
+    },
+    "quiz_b24d6d32a5": {
+      "topic": "AI",
+      "file": "AI.json",
+      "question_type": "csat_passage_set",
+      "langsmith_project": "quiz-AI-9252"
+    }
+  }
 }

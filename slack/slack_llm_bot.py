@@ -48,6 +48,48 @@ from QUIZ.quiz_engine import (
 _IMPORT_LOCK = threading.Lock()
 _QUIZ_DBMS = QuizProjectDBMS(base_dir=os.path.join(_BASE_DIR, "PROJECT"))
 
+def _extract_delete_args_with_llm(user_text: str, chosen: Dict[str, Any]) -> Dict[str, Any]:
+    """선택된 delete_news_records 툴에 맞춰 사용자 요청에서 인자를 LLM으로 추출합니다."""
+    merged = _unwrap_tool_args(chosen)
+    schema = {
+        "target_backend": "sqlite | postgres | null",
+        "source": "언론사/섹션명만 (예: '연합', '조선일보', '동아/스포츠') | null",
+        "category": "분야명 (예: '경제', '정치', 'IT', '과학', '스포츠') | null",
+        "keyword": "본문/제목/키워드 검색어 | null",
+        "days": "최근 N일 기준 정수 | null",
+        "limit": "삭제할 건수 정수 | null",
+        "order": "oldest | newest",
+        "delete_all": "boolean (전체/전부/모두/다 삭제면 true, 조건/건수/키워드/언론사 삭제면 false)",
+    }
+
+    system_prompt = (
+        "당신은 delete_news_records 도구의 인자를 사용자 요청에서 추출하는 JSON 추출기입니다.\n"
+        "규칙:\n"
+        "1. 마크다운, 코드블록, 설명 없이 순수 JSON 객체 1개만 출력하세요.\n"
+        "2. 전체/전부/모두/다 삭제 요청이면 delete_all=true로 두고 나머지 필터(source, category, keyword, days, limit)는 null로 두세요.\n"
+        "3. '오래된/옛날/먼저 들어온' 표현이 있으면 order='oldest', 그 외에는 'newest'로 설정하세요.\n"
+        "4. 요청에 없는 값은 null로 채우세요.\n\n"
+        f"추출 스키마:\n{json.dumps(schema, ensure_ascii=False)}"
+    )
+
+    raw = _invoke_llm_with_fallback(
+        messages=[
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_text),
+        ],
+        temperature=0.0,
+        max_tokens=300,
+        prefer_local=True,
+    )
+    extracted = _extract_json(raw or "") or {}
+
+    # 1차 라우터에서 이미 넘어온 값이 있으면 추출 결과를 우선하되 누락분만 보완
+    result = dict(merged)
+    for k, v in extracted.items():
+        if v is not None:
+            result[k] = v
+    result["tool"] = "delete_news_records"
+    return result
 
 def _fetch_articles_for_quiz(keyword: Optional[str], limit: int) -> List[Dict[str, Any]]:
     raw_res = mcp_tools.get_recent_news_for_quiz(
@@ -70,6 +112,49 @@ def _fetch_articles_for_quiz(keyword: Optional[str], limit: int) -> List[Dict[st
             return matched[:limit]
     return articles[:limit]
 
+def _resolve_quiz_keyword_with_llm(
+    raw_kw: Optional[str],
+    user_text: str = "",
+) -> Optional[str]:
+    """퀴즈 생성 시 특정 키워드/주제로 필터링할지, 전체/랜덤 범위(None)로 둘지 LLM이 판별합니다."""
+    cleaned_kw = (raw_kw or "").strip()
+    cleaned_user = (user_text or "").strip()
+    if not cleaned_kw and not cleaned_user:
+        return None
+
+    prompt = (
+        "당신은 뉴스 퀴즈 생성의 주제/키워드 필터를 판별하는 분류기입니다.\n"
+        "후보 키워드와 사용자 원문을 보고 특정 주제/키워드로 좁혀야 하면 해당 키워드 문자열을, "
+        "전체/랜덤/아무거나/일반 등 특정 주제 제한이 없으면 null을 반환하세요.\n\n"
+        "규칙:\n"
+        "1. '전체', '모두', '일반', '랜덤', '아무거나', '최근 뉴스'처럼 특정 주제/키워드가 아닌 경우 반드시 null을 출력하세요.\n"
+        "2. '반도체', '금리', 'AI', '정치', '경제'처럼 특정 주제나 키워드가 명확하면 핵심 키워드만 문자열로 출력하세요.\n"
+        "3. 마크다운, 코드블록, 설명 없이 오직 JSON 1개만 출력하세요.\n"
+        '출력 형식: {"keyword": "반도체"} 또는 {"keyword": null}\n\n'
+        f"후보 키워드: {cleaned_kw!r}\n"
+        f"사용자 원문: {cleaned_user!r}"
+    )
+
+    parsed = _extract_json(
+        _invoke_llm_with_fallback(
+            messages=[HumanMessage(content=prompt)],
+            temperature=0.0,
+            max_tokens=100,
+            prefer_local=True,
+        )
+        or ""
+    )
+
+    if isinstance(parsed, dict) and "keyword" in parsed:
+        val = parsed.get("keyword")
+        if val is None:
+            return None
+        val_str = str(val).strip()
+        if not val_str or val_str.lower() in ("null", "none"):
+            return None
+        return val_str
+
+    return cleaned_kw or None
 
 def _llm_for_quiz_graph(prompt: str, max_tokens: int) -> Optional[str]:
     prefer_local = (os.getenv("QUIZ_LLM_PROVIDER") or "").strip().lower() == "ollama"
@@ -193,31 +278,149 @@ def _extract_json(raw_text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _normalize_backend_value(raw_val: Any) -> Optional[str]:
-    if raw_val is None:
-        return None
-    val = str(raw_val).strip().lower()
-    if not val or val in ("null", "none", "auto", "default", "미지정"):
-        return None
-    if val in ("sqlite", "file", "local", "로컬", "파일"):
+def _resolve_backend_value_with_llm(
+    raw_val: Any,
+    user_text: str = "",
+    default: Optional[str] = None,
+) -> Optional[str]:
+    """추출된 값과 사용자 요청 문맥을 바탕으로 저장소 백엔드('sqlite' | 'postgres' | None)를 LLM이 판단합니다."""
+    if raw_val is None or isinstance(raw_val, bool):
+        raw_str = ""
+    else:
+        raw_str = str(raw_val).strip()
+
+    if not raw_str and not (user_text or "").strip():
+        return default
+
+    prompt = (
+        "당신은 저장소 백엔드 대상을 판별하는 분류기입니다.\n"
+        "후보 값과 사용자 원문을 보고 아래 세 값 중 하나만 JSON으로 출력하세요:\n"
+        '- "sqlite": 로컬 파일 기반 SQLite 저장소(예: sqlite, 파일, 로컬 파일, news_store.sqlite 등)\n'
+        '- "postgres": 원격 DB 저장소(예: postgres, postgresql, neon, 네온, 네온db, db 등)\n'
+        "- null: 특정 저장소가 명시되지 않았거나 미지정/자동/null인 경우\n\n"
+        "규칙:\n"
+        "1. 마크다운, 코드블록, 설명 없이 오직 JSON 1개만 출력하세요.\n"
+        '출력 형식: {"backend": "sqlite"} 또는 {"backend": "postgres"} 또는 {"backend": null}\n\n'
+        f"후보 값: {raw_val!r}\n"
+        f"사용자 원문: {user_text!r}"
+    )
+
+    parsed = _extract_json(
+        _invoke_llm_with_fallback(
+            messages=[HumanMessage(content=prompt)],
+            temperature=0.0,
+            max_tokens=100,
+            prefer_local=True,
+        )
+        or ""
+    )
+
+    if isinstance(parsed, dict) and "backend" in parsed:
+        b = parsed.get("backend")
+        if b is None:
+            return None
+        b_clean = str(b).strip().lower()
+        if b_clean in ("sqlite", "postgres"):
+            return b_clean
+
+    # LLM 응답이 없거나 파싱 실패 시 최소한의 안전 폴백
+    low = f"{raw_str} {user_text}".lower()
+    if "sqlite" in low:
         return "sqlite"
-    if val in ("postgres", "postgresql", "neon", "네온", "네온db", "db", "디비", "디지털 db"):
+    if "postgres" in low or "neon" in low or "네온" in low:
         return "postgres"
-    return None
+    return default
 
+def _fetch_articles_for_quiz(keyword: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    fetch_n = max(limit * 3, 15)
+    raw_res = mcp_tools.get_recent_news_for_quiz(
+        category="전체",
+        limit=fetch_n,
+        sqlite_path=DEFAULT_SQLITE_PATH,
+    )
+    bundle = json.loads(raw_res) if raw_res else {}
+    articles = list(bundle.get("articles") or [])
 
-def _normalize_positive_int(raw_val: Any, default: Optional[int] = None) -> Optional[int]:
+    if keyword:
+        cat_res = mcp_tools.get_recent_news_for_quiz(
+            category=keyword,
+            limit=fetch_n,
+            sqlite_path=DEFAULT_SQLITE_PATH,
+        )
+        cat_bundle = json.loads(cat_res) if cat_res else {}
+        seen_titles = {a.get("title") for a in articles}
+        for a in cat_bundle.get("articles") or []:
+            if a.get("title") not in seen_titles:
+                articles.append(a)
+                seen_titles.add(a.get("title"))
+
+        kw_low = keyword.lower()
+        matched = [
+            a
+            for a in articles
+            if kw_low in str(a.get("title") or "").lower()
+            or kw_low in str(a.get("facts") or "").lower()
+            or kw_low in str(a.get("opinion") or "").lower()
+            or kw_low in str(a.get("category") or "").lower()
+        ]
+        if matched:
+            return matched[:limit]
+
+    return articles[:limit]
+
+def _resolve_positive_int_with_llm(
+    raw_val: Any,
+    user_text: str = "",
+    field_name: str = "count",
+    default: Optional[int] = None,
+) -> Optional[int]:
+    """원본 값과 사용자 요청 문맥을 바탕으로 양의 정수(1 이상)인지 LLM이 판단합니다."""
     if raw_val is None or isinstance(raw_val, bool):
         return default
+
+    raw_str = str(raw_val).strip()
+    if not raw_str:
+        return default
+
+    prompt = (
+        "당신은 사용자 요청과 추출된 값을 보고 양의 정수(1 이상의 정수)를 확정하는 판별기입니다.\n"
+        "규칙:\n"
+        "1. '전체', '모두', '다', '전부', '제한없음', '미지정', 'null', 'none', 0 이하, 음수 등 "
+        "구체적인 양의 개수가 아니거나 전체 대상이면 반드시 null을 출력하세요.\n"
+        "2. 명확한 양의 정수(예: 1, 3, 5, '3개', '최근 7일')라면 해당 정수만 숫자로 출력하세요.\n"
+        "3. 마크다운, 코드블록, 설명 없이 오직 JSON 1개만 출력하세요.\n"
+        '출력 형식: {"value": 3} 또는 {"value": null}\n\n'
+        f"필드명: {field_name}\n"
+        f"후보 값: {raw_val!r}\n"
+        f"사용자 원문: {user_text!r}"
+    )
+
+    parsed = _extract_json(
+        _invoke_llm_with_fallback(
+            messages=[HumanMessage(content=prompt)],
+            temperature=0.0,
+            max_tokens=100,
+            prefer_local=True,
+        )
+        or ""
+    )
+
+    if isinstance(parsed, dict) and "value" in parsed:
+        val = parsed.get("value")
+        if val is None:
+            return None
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+        if isinstance(val, str) and val.strip().isdigit():
+            num = int(val.strip())
+            return num if num > 0 else None
+
+    # LLM 응답이 없거나 형식이 어긋난 경우 최소한의 안전 파싱
     if isinstance(raw_val, int):
         return raw_val if raw_val > 0 else None
-    if isinstance(raw_val, str):
-        cleaned = raw_val.strip()
-        if not cleaned or cleaned.lower() in ("null", "none", "all", "전체", "모두", "다"):
-            return None
-        if cleaned.isdigit():
-            num = int(cleaned)
-            return num if num > 0 else None
+    if raw_str.isdigit():
+        num = int(raw_str)
+        return num if num > 0 else None
     return default
 
 
@@ -419,8 +622,7 @@ def _parse_hms_chunk(text: str) -> tuple[float, float, float]:
     m = sum(float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*분", text))
     s = sum(float(m) for m in re.findall(r"(\d+(?:\.\d+)?)\s*초", text))
     return h, m, s
-
-
+# llm 실패 대비 하드코딩
 def _resolve_target_datetime(user_text: str, now: datetime) -> Optional[datetime]:
     if "까지" not in user_text:
         return None
@@ -508,6 +710,52 @@ def _resolve_target_datetime(user_text: str, now: datetime) -> Optional[datetime
 
     return candidate
 
+def _resolve_target_datetime_with_llm(
+    user_text: str,
+    now: datetime,
+    chosen: Optional[Dict[str, Any]] = None,
+) -> Optional[datetime]:
+    """현재 시각 기준으로 사용자 요청의 목표 시각('~까지')을 LLM이 해석합니다."""
+    if not (user_text or "").strip():
+        return None
+
+    chosen_hint = ""
+    if isinstance(chosen, dict) and chosen.get("until_iso"):
+        chosen_hint = f"\n초기 추출 힌트(until_iso): {chosen.get('until_iso')}"
+
+    prompt = (
+        "당신은 사용자 요청에서 종료/목표 시각('~까지')을 계산하는 시간 파서입니다.\n"
+        "현재 기준 시각을 참고해 목표 시각을 'YYYY-MM-DDTHH:MM:SS' 형식 문자열로 반환하세요.\n"
+        "규칙:\n"
+        "1. 명확한 종료 시각/날짜/요일/상대시각('~까지', '내일 18시까지', '금요일 밤까지' 등)이 없으면 value를 null로 두세요.\n"
+        "2. '반'은 30분, '정오'는 12:00:00, '자정'은 00:00:00(시각이 이미 지났거나 밤 자정 맥락이면 다음 날 00:00:00)으로 해석하세요.\n"
+        "3. 마크다운, 코드블록, 설명 없이 오직 JSON 1개만 출력하세요.\n"
+        '출력 형식: {"until_iso": "2026-11-27T18:00:00"} 또는 {"until_iso": null}\n\n'
+        f"현재 시각: {now.isoformat(timespec='seconds')}\n"
+        f"사용자 원문: {user_text!r}{chosen_hint}"
+    )
+
+    parsed = _extract_json(
+        _invoke_llm_with_fallback(
+            messages=[HumanMessage(content=prompt)],
+            temperature=0.0,
+            max_tokens=120,
+            prefer_local=True,
+        )
+        or ""
+    )
+
+    if isinstance(parsed, dict) and "until_iso" in parsed:
+        raw_iso = parsed.get("until_iso")
+        if raw_iso is None or str(raw_iso).strip().lower() in ("", "null", "none"):
+            return None
+        try:
+            return datetime.fromisoformat(str(raw_iso).strip())
+        except Exception:
+            pass
+
+    # LLM 응답이 없거나 파싱 실패 시 기존 정규식 로직으로 폴백
+    return _resolve_target_datetime(user_text, now)
 
 def _extract_request_text_from_user(user_text: str) -> str:
     cleaned = user_text.strip()
@@ -616,7 +864,7 @@ def _parse_schedule_plan(user_text: str, chosen: Dict[str, Any]) -> Dict[str, An
             deadline = None
 
     if deadline is None:
-        deadline = _resolve_target_datetime(user_text, now)
+        deadline = _resolve_target_datetime_with_llm(user_text, now)
 
     if deadline is None:
         dur_h = _to_nonneg_float(chosen.get("duration_hours"), 0.0)
@@ -1007,7 +1255,7 @@ def handle_mention(event, say, client):
         return
 
     if tool == "set_storage_backend":
-        target_mode = _normalize_backend_value(chosen.get("storage_backend"))
+        target_mode = _resolve_backend_value_with_llm(chosen.get("storage_backend"))
         if not target_mode:
             target_mode = "postgres" if get_active_storage_backend() == "sqlite" else "sqlite"
         raw_res = mcp_tools.set_storage_backend(target_mode)
@@ -1081,14 +1329,18 @@ def handle_mention(event, say, client):
 
     if tool in ("get_recent_news_for_quiz", "create_quiz_with_template"):
         chosen = _unwrap_tool_args(chosen)
-        raw_kw = _clean_str_arg(chosen.get("keyword")) or _clean_str_arg(chosen.get("category"))
-        if raw_kw and raw_kw.lower() in ("전체", "일반", "all", "랜덤", "아무거나"):
-            raw_kw = None
+        candidate_kw = _clean_str_arg(chosen.get("keyword")) or _clean_str_arg(chosen.get("category"))
+        raw_kw = _resolve_quiz_keyword_with_llm(candidate_kw, user_text=user_text)
         q_type = _clean_str_arg(chosen.get("question_type"))
         llm_rule = _clean_str_arg(chosen.get("llm_rule"))
         raw_rubric = chosen.get("custom_rubric")
         rubric_list = [str(x) for x in raw_rubric] if isinstance(raw_rubric, list) else None
-        limit = _normalize_positive_int(chosen.get("limit"), default=4) or 4
+        limit = _resolve_positive_int_with_llm(
+            chosen.get("limit"),
+            user_text=user_text,
+            field_name="limit",
+            default=4,
+        ) or 4
 
         say(text="🧠 Top-K 도구 라우팅 및 *LangGraph + LangSmith*로 퀴즈를 생성해 `PROJECT/`에 저장 중이에요...")
         result = generate_and_save_quiz_with_graph(
@@ -1102,20 +1354,21 @@ def handle_mention(event, say, client):
             llm_rule=llm_rule,
             limit=limit,
         )
-        posted = say(text=format_quiz_for_slack(result))
+        posted = say(text=format_quiz_for_slack(result, articles=result.get("articles")))
+        posted_data = getattr(posted, "data", posted) if posted is not None else {}
         thread_ts = None
-        if isinstance(posted, dict):
-            thread_ts = posted.get("ts") or (posted.get("message") or {}).get("ts")
+        if isinstance(posted_data, dict):
+            thread_ts = posted_data.get("ts") or (posted_data.get("message") or {}).get("ts")
         if thread_ts:
             rec = result["quiz_record"]
             _QUIZ_DBMS.save_quiz(
                 topic=rec["topic"],
                 quiz_record=rec,
-                thread_ts=thread_ts,
+                thread_ts=str(thread_ts),
                 channel_id=event.get("channel"),
             )
-        return
-
+        return    
+    
     if tool == "manage_quiz_project_db":
         chosen = _unwrap_tool_args(chosen)
         action = (_clean_str_arg(chosen.get("action")) or "list").lower()
@@ -1215,7 +1468,7 @@ def handle_mention(event, say, client):
         return
 
     if tool == "get_storage_stats":
-        target_backend = _normalize_backend_value(chosen.get("target_backend"))
+        target_backend = _resolve_backend_value_with_llm(chosen.get("target_backend"))
         raw_res = mcp_tools.get_storage_stats(
             target_backend=target_backend,
             sqlite_path=DEFAULT_SQLITE_PATH,
@@ -1279,7 +1532,7 @@ def handle_mention(event, say, client):
         return
 
     if tool == "sync_sqlite_to_postgres":
-        sync_limit = _normalize_positive_int(chosen.get("limit"), default=None)
+        sync_limit = _resolve_positive_int_with_llm(chosen.get("limit"), default=None)
         raw_res = mcp_tools.sync_sqlite_to_postgres(
             limit=sync_limit,
             sqlite_path=DEFAULT_SQLITE_PATH,
@@ -1289,7 +1542,7 @@ def handle_mention(event, say, client):
         return
 
     if tool == "sync_postgres_to_sqlite":
-        sync_limit = _normalize_positive_int(chosen.get("limit"), default=None)
+        sync_limit = _resolve_positive_int_with_llm(chosen.get("limit"), default=None)
         raw_res = mcp_tools.sync_postgres_to_sqlite(
             limit=sync_limit,
             sqlite_path=DEFAULT_SQLITE_PATH,
@@ -1299,8 +1552,12 @@ def handle_mention(event, say, client):
         return
 
     if tool == "delete_news_records":
-        chosen = _unwrap_tool_args(chosen)
-        print(f"[DEBUG_DEL] chosen={chosen} delete_all_raw={chosen.get('delete_all')}", file=sys.stderr)
+        chosen = _extract_delete_args_with_llm(user_text, chosen)
+        print(
+            f"[DEBUG_DEL] chosen={chosen} delete_all_raw={chosen.get('delete_all')}",
+            file=sys.stderr,
+        )
+
         raw_delete_all = chosen.get("delete_all")
         if isinstance(raw_delete_all, bool):
             delete_all_val = raw_delete_all
@@ -1309,7 +1566,7 @@ def handle_mention(event, say, client):
         else:
             delete_all_val = False
 
-        target_backend = _normalize_backend_value(_clean_str_arg(chosen.get("target_backend")))
+        target_backend = _resolve_backend_value_with_llm(_clean_str_arg(chosen.get("target_backend")))
 
         if delete_all_val:
             source_val = None
@@ -1322,16 +1579,11 @@ def handle_mention(event, say, client):
             source_val = _clean_str_arg(chosen.get("source"))
             category_val = _clean_str_arg(chosen.get("category"))
             keyword_val = _clean_str_arg(chosen.get("keyword"))
-            days_val = _normalize_positive_int(chosen.get("days"), default=None)
-            limit_val = _normalize_positive_int(chosen.get("limit"), default=None)
+            days_val = _resolve_positive_int_with_llm(chosen.get("days"), default=None)
+            limit_val = _resolve_positive_int_with_llm(chosen.get("limit"), default=None)
 
             raw_order = str(_clean_str_arg(chosen.get("order")) or "").strip().lower()
-            if raw_order in ("oldest", "asc", "오래된", "과거") or any(
-                k in user_text for k in ("오래된", "옛날", "가장 먼저", "먼저 들어온")
-            ):
-                order_val = "oldest"
-            else:
-                order_val = "newest"
+            order_val = "oldest" if raw_order in ("oldest", "asc") else "newest"
 
         raw_res = mcp_tools.delete_news_records(
             source=source_val,
@@ -1349,7 +1601,7 @@ def handle_mention(event, say, client):
             err_msg = data.get("message") if isinstance(data, dict) else None
             say(text=f"⚠️ 삭제 처리 안내: {err_msg or '삭제할 수 없었어요.'}")
             return
-        
+
         applied = data.get("filters") or {}
         cond_parts = []
         if applied.get("delete_all"):
@@ -1377,7 +1629,6 @@ def handle_mention(event, say, client):
             )
         )
         return
-
 @app.event("message")
 def handle_message_events(event, say):
     if event.get("subtype") == "bot_message" or event.get("bot_id"):
@@ -1394,19 +1645,22 @@ def handle_message_events(event, say):
     attached_files = event.get("files") or []
     if attached_files:
         _process_slack_files(attached_files, say)
-
-# handle_message_events 안쪽, 일반 메시지 처리 전에 추가
     thread_ts = event.get("thread_ts")
-    if thread_ts and raw_text:
-        matched_quiz = _QUIZ_DBMS.get_by_thread(thread_ts)
+    cleaned_text = _clean_mention_text(event.get("text") or "")
+    if thread_ts and cleaned_text:
+        matched_quiz = _QUIZ_DBMS.get_by_thread(str(thread_ts))
         if matched_quiz:
             verdict_msg = _grade_thread_submission(
                 quiz_record=matched_quiz,
-                user_answer=raw_text,
+                user_answer=cleaned_text,
                 user_id=event.get("user") or "unknown",
             )
             say(text=verdict_msg, thread_ts=thread_ts)
             return
+
+    raw_text = (event.get("text") or "").strip()
+    if re.search(r"<@[A-Z0-9_]+>", raw_text):
+        return
     
 
 

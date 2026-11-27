@@ -167,24 +167,6 @@ def set_storage_backend(storage_backend: str) -> str:
     )
 
 
-@mcp.tool()
-def get_recent_news_for_quiz(
-    category: str = "경제",
-    limit: int = 3,
-    storage_backend: Optional[str] = None,
-    sqlite_path: Optional[str] = None,
-) -> str:
-    """최근 뉴스 데이터를 조회합니다."""
-    path = _resolve_sqlite_target(sqlite_path)
-    result = fetch_recent_news(
-        category=category,
-        limit=limit,
-        days=7,
-        storage_backend=storage_backend,
-        sqlite_path=path,
-    )
-    return json.dumps(result, ensure_ascii=False)
-
 
 @mcp.tool()
 def run_rss_sources(

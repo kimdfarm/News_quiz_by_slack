@@ -8,12 +8,10 @@ from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-QUIZ_TYPES = [
-    "multi_perspective",     # 1. 다각도 언론 비교·논증 서술형
-    "csat_passage_set",      # 2. 수능/비문학형 지문 + 2~3문항 세트
-    "custom_rubric_essay",   # 3. 커스텀 루브릭 기반 코칭 서술형
-    "fact_check_trap",       # 4. 팩트체크 & 함정 선지 판별형
-]
+from QUIZ.types import get_quiz_type_names, get_quiz_type_spec, load_all_quiz_types
+
+load_all_quiz_types()
+QUIZ_TYPES = get_quiz_type_names()
 
 
 def sanitize_topic_filename(topic: str) -> str:
@@ -124,7 +122,7 @@ class QuizProjectDBMS:
             "langsmith_project": (quiz_record.get("langsmith") or {}).get("project_name"),
         }
         if thread_ts:
-            index_data["threads"][thread_ts] = {
+            index_data["threads"][str(thread_ts)] = {
                 "quiz_id": quiz_id,
                 "topic": topic,
                 "file": os.path.basename(file_path),
@@ -135,7 +133,7 @@ class QuizProjectDBMS:
 
     def get_by_thread(self, thread_ts: str) -> Optional[Dict[str, Any]]:
         index_data = self._read_json(self.index_path)
-        meta = (index_data.get("threads") or {}).get(thread_ts)
+        meta = (index_data.get("threads") or {}).get(str(thread_ts))
         if not meta:
             return None
         items = self.select_quizzes(topic=meta.get("topic"), quiz_id=meta.get("quiz_id"))
@@ -224,14 +222,30 @@ class QuizProjectDBMS:
             count += 1
         return count
 
+    def get_existing_summaries(self, limit: int = 20) -> List[str]:
+        summaries: List[str] = []
+        for rec in self.select_quizzes():
+            q_type = rec.get("question_type", "")
+            topic = rec.get("topic", "")
+            title = rec.get("title", "")
+            summaries.append(f"[{topic} | {q_type}] {title}")
+            if len(summaries) >= limit:
+                break
+        return summaries
+
 
 class QuizGenState(TypedDict):
     user_text: str
     keyword: Optional[str]
+    rag_query: Optional[str]
     question_type: Optional[str]
     custom_rubric: List[str]
     llm_rule: Optional[str]
+    existing_ctx: str
     articles: List[Dict[str, Any]]
+    relevance_ok: bool
+    rag_feedback: str
+    rag_retry_count: int
     draft_quiz: Dict[str, Any]
     quality_report: Dict[str, Any]
     retry_count: int
@@ -240,7 +254,7 @@ class QuizGenState(TypedDict):
 
 def _articles_to_context(articles: List[Dict[str, Any]]) -> str:
     if not articles:
-        return "(저장된 기사 데이터가 부족하여 일반 시사 맥락을 참고합니다.)"
+        return "(저장된 기사 데이터 중 요청 주제와 직접 일치하는 기사가 부족합니다.)"
     lines = []
     for i, a in enumerate(articles[:6], 1):
         lines.append(
@@ -249,6 +263,38 @@ def _articles_to_context(articles: List[Dict[str, Any]]) -> str:
             f"    관점({a.get('stance_type') or '중립'}): {a.get('opinion') or ''}"
         )
     return "\n".join(lines)
+
+
+def _infer_type_with_llm(
+    user_text: str,
+    requested_type: Optional[str],
+    llm_call_fn: Callable[[str, int], Optional[str]],
+) -> str:
+    available = load_all_quiz_types()
+    if requested_type and requested_type in available:
+        # 사용자가 명시적으로 "서술형"을 요구했는데 객관식 유형이 들어온 경우 보정
+        if "서술형" in user_text and available[requested_type].get("allow_choices"):
+            return "multi_perspective" if "multi_perspective" in available else requested_type
+        return requested_type
+
+    if "서술형" in user_text:
+        return "multi_perspective" if "multi_perspective" in available else random.choice(list(available.keys()))
+
+    catalog = [
+        {"name": k, "label": v.get("label", k), "description": v.get("description", "")}
+        for k, v in available.items()
+    ]
+    prompt = (
+        "사용자 요청에 가장 알맞은 문제 유형(name) 1개를 고르세요. JSON만 출력하세요.\n"
+        '출력 형식: {"question_type": "유형name"}\n\n'
+        f"사용자 요청: {user_text}\n"
+        f"사용 가능한 유형 목록: {json.dumps(catalog, ensure_ascii=False)}"
+    )
+    parsed = _extract_json_obj(llm_call_fn(prompt, 150) or "")
+    picked = (parsed or {}).get("question_type")
+    if picked in available:
+        return picked
+    return random.choice(list(available.keys()))
 
 
 def generate_and_save_quiz_with_graph(
@@ -262,71 +308,164 @@ def generate_and_save_quiz_with_graph(
     llm_rule: Optional[str] = None,
     limit: int = 4,
 ) -> Dict[str, Any]:
-    # 라우터 LLM이 결정한 question_type/keyword/llm_rule을 그대로 존중하고, 없을 때만 랜덤으로 채움
-    resolved_type = question_type if question_type in QUIZ_TYPES else random.choice(QUIZ_TYPES)
+    resolved_type = _infer_type_with_llm(user_text, question_type, llm_call_fn)
+    type_spec = get_quiz_type_spec(resolved_type)
+
     topic_label = sanitize_topic_filename(keyword or f"random_{resolved_type}")
     ls_project = f"quiz-{topic_label}-{uuid.uuid4().hex[:4]}"
 
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
     os.environ["LANGCHAIN_PROJECT"] = ls_project
 
+    existing_summaries = dbms.get_existing_summaries(limit=20)
+    existing_ctx = "\n".join(f"- {s}" for s in existing_summaries)
+
     def node_fetch_rag(state: QuizGenState) -> Dict[str, Any]:
-        kw = state.get("keyword")
-        articles = fetch_articles_fn(kw, limit)
-        if not articles and kw:
-            articles = fetch_articles_fn(None, limit)
-        if not kw:
-            titles = [str(a.get("title") or "") for a in articles if a.get("title")]
+        query = state.get("rag_query") or state.get("keyword")
+        # 후보군을 넉넉히 조회해서 LangGraph가 정밀 필터링하도록 전달
+        articles = fetch_articles_fn(query, max(limit * 3, 12))
+        if not articles and query:
+            articles = fetch_articles_fn(None, max(limit * 3, 12))
+        return {"articles": articles}
+
+    def node_judge_relevance(state: QuizGenState) -> Dict[str, Any]:
+        target_topic = (state.get("keyword") or "").strip()
+        articles = state.get("articles") or []
+        retry_cnt = int(state.get("rag_retry_count") or 0)
+
+        if not articles:
+            return {
+                "relevance_ok": False,
+                "rag_retry_count": retry_cnt + 1,
+                "rag_feedback": "DB에서 조회된 기사가 없습니다.",
+            }
+
+        # 특정 키워드/주제 지정이 없으면 바로 통과
+        if not target_topic:
+            picked = articles[:limit]
+            titles = [str(a.get("title") or "") for a in picked if a.get("title")]
             words = [
                 w
                 for t in titles
                 for w in re.findall(r"[가-힣A-Za-z0-9]{2,}", t)
                 if w not in ("뉴스", "기사", "논란", "발표", "전망", "시장")
             ]
-            kw = random.choice(words) if words else "시사_이슈"
-        return {"keyword": kw, "articles": articles}
+            auto_kw = random.choice(words) if words else "시사_이슈"
+            return {
+                "keyword": auto_kw,
+                "articles": picked,
+                "relevance_ok": True,
+                "rag_feedback": "",
+            }
+
+        compact = [
+            {
+                "idx": i,
+                "title": a.get("title", ""),
+                "category": a.get("category", ""),
+                "source": a.get("source") or a.get("press") or "",
+                "summary": str(a.get("facts") or a.get("summary") or a.get("opinion") or "")[:200],
+            }
+            for i, a in enumerate(articles[:12])
+        ]
+
+        prompt = (
+            "당신은 RAG 검색 결과의 주제 적합성을 엄격히 판별하는 심사관입니다.\n"
+            f"요청 주제/키워드: {target_topic}\n"
+            f"사용자 원문: {state['user_text']}\n\n"
+            "아래 기사 목록 중 요청 주제와 직접적으로 관련이 있는 기사 인덱스(indices)만 고르세요.\n"
+            "예: 요청 주제가 'AI'인데 단순 e스포츠/게임 대회/퍼블리싱 기사라면 절대 선택하지 마세요.\n"
+            "관련 기사가 하나도 없으면 indices를 []로 두고 reason에 불일치 사유를 적으세요.\n"
+            'JSON만 출력: {"indices": [0, 2], "reason": "판별 이유"}\n\n'
+            f"기사 목록:\n{json.dumps(compact, ensure_ascii=False)}"
+        )
+
+        parsed = _extract_json_obj(llm_call_fn(prompt, 300) or "") or {}
+        raw_indices = parsed.get("indices") if isinstance(parsed.get("indices"), list) else []
+        valid_indices = [
+            int(idx)
+            for idx in raw_indices
+            if isinstance(idx, (int, str)) and str(idx).isdigit() and 0 <= int(idx) < len(articles[:12])
+        ]
+        filtered = [articles[:12][i] for i in valid_indices]
+
+        if filtered:
+            return {
+                "articles": filtered[:limit],
+                "relevance_ok": True,
+                "rag_feedback": "",
+            }
+
+        return {
+            "articles": [],
+            "relevance_ok": False,
+            "rag_retry_count": retry_cnt + 1,
+            "rag_feedback": str(parsed.get("reason") or f"'{target_topic}' 주제와 직접 관련된 기사를 찾지 못했습니다."),
+        }
+
+    def node_rewrite_rag_query(state: QuizGenState) -> Dict[str, Any]:
+        prev_q = state.get("rag_query") or state.get("keyword") or ""
+        reason = state.get("rag_feedback") or ""
+        prompt = (
+            "이전 RAG 검색에서 요청 주제와 맞는 기사를 찾지 못했습니다.\n"
+            "DB에서 관련 기사를 정밀하게 찾기 위한 대체 핵심 검색어(1단어 또는 짧은 키워드) 1개를 제안하세요.\n"
+            "예: 'AI' -> '인공지능', 'LLM', '생성형', '반도체'\n"
+            'JSON만 출력: {"next_query": "대체검색어"}\n\n'
+            f"원래 주제: {state.get('keyword')}\n"
+            f"이전 검색어: {prev_q}\n"
+            f"실패 사유: {reason}"
+        )
+        parsed = _extract_json_obj(llm_call_fn(prompt, 150) or "") or {}
+        next_q = str(parsed.get("next_query") or "").strip() or None
+        return {"rag_query": next_q}
+
+    def route_after_relevance(state: QuizGenState) -> str:
+        if state.get("relevance_ok"):
+            return "generate"
+        if int(state.get("rag_retry_count") or 0) >= 2:
+            return "generate"
+        return "rewrite_rag"
 
     def node_generate(state: QuizGenState) -> Dict[str, Any]:
-        ctx = _articles_to_context(state["articles"])
-        q_type = state["question_type"] or "csat_passage_set"
+        articles = state.get("articles") or []
+        ctx = _articles_to_context(articles)
+        q_type = state["question_type"] or resolved_type
+        spec = get_quiz_type_spec(q_type)
+        allow_choices = bool(spec.get("allow_choices")) and ("서술형" not in state["user_text"])
+
         prev_feedback = (state.get("quality_report") or {}).get("feedback") or ""
+        rag_warn = state.get("rag_feedback") or ""
         extra_rule = state.get("llm_rule") or ""
         rubric_list = state.get("custom_rubric") or [
             "핵심 쟁점 또는 근거를 정확히 제시했는가",
             "기사 사실과 모순되는 주장이 없는가",
         ]
-
-        type_guide = {
-            "multi_perspective": (
-                "다각도 언론 비교·논증 서술형 1문항을 만드세요. "
-                "서로 다른 시각/언론의 핵심 차이를 묻고, 모범답안과 채점 기준(rubric)을 포함하세요."
-            ),
-            "csat_passage_set": (
-                "수능/비문학형 지문 1개와 2~3개 문항 세트를 만드세요. "
-                "<보기> 적용 문항을 최소 1개 포함하고, 각 문항의 선택지, 정답, 해설을 작성하세요."
-            ),
-            "custom_rubric_essay": (
-                f"커스텀 루브릭 코칭 서술형 1문항을 만드세요. 적용할 채점 기준: {rubric_list}. "
-                "답변 시 챙겨야 할 체크리스트와 힌트 단계도 함께 작성하세요."
-            ),
-            "fact_check_trap": (
-                "기사 원문의 수치/주체/인과관계를 교묘하게 비튼 진술(함정)을 포함한 팩트체크 판별 문항을 만드세요. "
-                "틀린 부분, 실제 사실 근거, 수정 예시를 함께 작성하세요."
-            ),
-        }.get(q_type, "")
+        type_guide = spec["build_guide"](rubric_list)
+        format_rule = (
+            "객관식 문항이므로 choices 배열에 4~5개 선택지를 반드시 포함하세요."
+            if allow_choices
+            else "서술형/주관식 문항이므로 choices는 반드시 빈 배열([])로 출력하고 객관식 선지를 절대 생성하지 마세요."
+        )
 
         prompt = (
             f"주제 키워드: {state['keyword']}\n"
-            f"문제 유형: {q_type}\n"
+            f"문제 유형: {q_type} ({spec.get('label', q_type)})\n"
             f"사용자 요청: {state['user_text']}\n"
             + (f"최종 판별/출제 규칙: {extra_rule}\n" if extra_rule else "")
+            + (f"이미 PROJECT에 생성된 문제 목록(가능하면 겹치지 않게 출제):\n{state.get('existing_ctx', '')}\n" if state.get("existing_ctx") else "")
             + f"참고 기사:\n{ctx}\n\n"
             f"출제 지침: {type_guide}\n"
+            f"형식 강제 규칙: {format_rule}\n"
+            "중요: 참고 기사에 없는 내용을 억지로 기사 보도인 것처럼 지어내지 마세요.\n"
+            + (f"참고 알림: {rag_warn}\n" if rag_warn else "")
             + (f"이전 품질 검증 피드백(반드시 반영해 개선): {prev_feedback}\n" if prev_feedback else "")
             + "\n반드시 아래 JSON 형식으로만 출력하세요:\n"
             "{\n"
             '  "title": "문제 세트 제목",\n'
-            '  "passage": "지문 또는 상황 설명",\n'
+            '  "passage": "지문 또는 상황 설명(구체적 기사 요약·발췌 포함)",\n'
+            '  "source_excerpts": [\n'
+            '    {"source": "언론사/제목", "summary": "사용자가 답을 도출할 수 있는 핵심 사실·관점 요약"}\n'
+            "  ],\n"
             '  "questions": [\n'
             '    {"number": 1, "stem": "문항", "box_example": null, "choices": [], "answer": "정답/핵심요지", "explanation": "해설"}\n'
             "  ],\n"
@@ -353,19 +492,40 @@ def generate_and_save_quiz_with_graph(
                 "rubric": rubric_list,
             }
 
+        # 서술형일 경우 모델이 실수로 넣은 choices 원천 제거
+        if not allow_choices:
+            for q in parsed.get("questions") or []:
+                if isinstance(q, dict):
+                    q["choices"] = []
+
         quiz_id = f"quiz_{uuid.uuid4().hex[:10]}"
         parsed["quiz_id"] = quiz_id
         parsed["topic"] = state["keyword"]
         parsed["question_type"] = q_type
         parsed["llm_rule"] = extra_rule
-        parsed["source_count"] = len(state["articles"])
+        parsed["source_count"] = len(articles)
+        parsed["rag_relevance_ok"] = bool(state.get("relevance_ok"))
+        if rag_warn:
+            parsed["rag_warning"] = rag_warn
         return {"draft_quiz": parsed}
 
     def node_verify(state: QuizGenState) -> Dict[str, Any]:
         quiz = state["draft_quiz"]
+        spec = get_quiz_type_spec(quiz.get("question_type") or resolved_type)
+
+        # 1단계: 유형 플러그인의 구조적 검증 규칙 실행
+        plugin_ok, plugin_msg = spec["validate"](quiz)
+        if not plugin_ok:
+            return {
+                "quality_report": {"passed": False, "score": 0.2, "feedback": plugin_msg},
+                "retry_count": state.get("retry_count", 0) + 1,
+            }
+
+        # 2단계: LLM 품질/주제 정합성 평가
         judge_prompt = (
             "다음 퀴즈 초안의 품질을 0.0~1.0 점수로 평가하고 JSON으로만 답하세요.\n"
-            "평가 기준: 문항 완성도, 정답/해설/루브릭 존재 여부, 질문의 명확성, 지정 규칙 반영 여부.\n"
+            f"요청 주제: {state['keyword']} | 요청 유형: {quiz.get('question_type')} | 사용자 원문: {state['user_text']}\n"
+            "평가 기준: 요청 주제 일치 여부, 문항 형식 일치(서술형/객관식), 정답/해설/루브릭 존재 여부.\n"
             f"퀴즈 JSON:\n{json.dumps(quiz, ensure_ascii=False)[:2500]}\n\n"
             '출력 형식: {"passed": true, "score": 0.9, "feedback": "개선점 또는 양호"}'
         )
@@ -394,10 +554,19 @@ def generate_and_save_quiz_with_graph(
 
     graph = StateGraph(QuizGenState)
     graph.add_node("fetch_rag", node_fetch_rag)
+    graph.add_node("judge_relevance", node_judge_relevance)
+    graph.add_node("rewrite_rag_query", node_rewrite_rag_query)
     graph.add_node("generate", node_generate)
     graph.add_node("verify", node_verify)
+
     graph.set_entry_point("fetch_rag")
-    graph.add_edge("fetch_rag", "generate")
+    graph.add_edge("fetch_rag", "judge_relevance")
+    graph.add_conditional_edges(
+        "judge_relevance",
+        route_after_relevance,
+        {"rewrite_rag": "rewrite_rag_query", "generate": "generate"},
+    )
+    graph.add_edge("rewrite_rag_query", "fetch_rag")
     graph.add_edge("generate", "verify")
     graph.add_conditional_edges("verify", route_after_verify, {"retry": "generate", "done": END})
     compiled = graph.compile()
@@ -405,10 +574,15 @@ def generate_and_save_quiz_with_graph(
     initial_state: QuizGenState = {
         "user_text": user_text,
         "keyword": keyword,
+        "rag_query": keyword,
         "question_type": resolved_type,
         "custom_rubric": custom_rubric or [],
         "llm_rule": llm_rule,
+        "existing_ctx": existing_ctx,
         "articles": [],
+        "relevance_ok": False,
+        "rag_feedback": "",
+        "rag_retry_count": 0,
         "draft_quiz": {},
         "quality_report": {},
         "retry_count": 0,
@@ -435,6 +609,7 @@ def generate_and_save_quiz_with_graph(
     quiz_record["langsmith"] = {
         "project_name": ls_project,
         "attempts": final_state["retry_count"],
+        "rag_retries": final_state["rag_retry_count"],
     }
 
     saved_path = dbms.save_quiz(topic=quiz_record["topic"], quiz_record=quiz_record)
@@ -442,33 +617,53 @@ def generate_and_save_quiz_with_graph(
         "quiz_record": quiz_record,
         "saved_path": saved_path,
         "ls_project": ls_project,
+        "articles": final_state.get("articles") or [],
     }
 
 
-def format_quiz_for_slack(result: Dict[str, Any]) -> str:
+def format_quiz_for_slack(result: Dict[str, Any], articles: Optional[List[Dict[str, Any]]] = None) -> str:
     rec = result["quiz_record"]
+    spec = get_quiz_type_spec(rec.get("question_type") or "")
     q_report = rec.get("quality_report") or {}
+
     lines = [
-        f"📝 *[퀴즈 생성 완료]* `{rec.get('topic')}` | 유형: `{rec.get('question_type')}`",
+        f"📝 *[퀴즈 생성 완료]* `{rec.get('topic')}` | 유형: `{rec.get('question_type')}` ({spec.get('label', '')})",
         f"• 저장 파일: `{os.path.relpath(result['saved_path'])}` | LangSmith: `{result['ls_project']}` (품질 {q_report.get('score', 0):.2f})",
-        "",
-        f"*{rec.get('title') or '문제'}*",
     ]
+    if rec.get("rag_warning"):
+        lines.append(f"⚠️ *RAG 탐색 안내*: {rec['rag_warning']}")
+
+    lines.extend(["", f"*{rec.get('title') or '문제'}*"])
     if rec.get("passage"):
         lines.append(f"> {rec['passage']}")
-    lines.append("")
 
+    excerpts = rec.get("source_excerpts") or []
+    if excerpts:
+        lines.append("\n*참고 기사 자료*")
+        for ex in excerpts[:4]:
+            src = ex.get("source") or "기사"
+            summ = ex.get("summary") or ""
+            lines.append(f"• *{src}*: {summ}")
+    elif articles:
+        lines.append("\n*참고 기사 자료*")
+        for a in articles[:4]:
+            title = a.get("title") or "제목 없음"
+            body = (a.get("facts") or a.get("summary") or a.get("content") or a.get("opinion") or "").strip()
+            lines.append(f"• *{title}*: {body[:180]}")
+
+    lines.append("")
     for q in rec.get("questions") or []:
         lines.append(f"*Q{q.get('number', '')}.* {q.get('stem', '')}")
         if q.get("box_example"):
             lines.append(f"```<보기>\n{q['box_example']}\n```")
-        for ch in q.get("choices") or []:
-            lines.append(f"  {ch}")
+        if spec.get("allow_choices"):
+            for ch in q.get("choices") or []:
+                lines.append(f"  {ch}")
 
     if rec.get("rubric"):
         lines.append("\n*채점 기준*")
         for r in rec["rubric"]:
             lines.append(f"• {r}")
 
-    lines.append("\n_이 메시지의 스레드에 답안을 남겨주시면 참·거짓/루브릭으로 판별해 드릴게요._")
+    lines.append("\n_위 참고 기사 자료를 바탕으로 이 메시지의 스레드에 답안을 남겨주시면 참·거짓/루브릭으로 판별해 드릴게요._")
     return "\n".join(lines)

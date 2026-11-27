@@ -484,41 +484,41 @@ def sync_sqlite_to_postgres(
             content_hash = (r.get("content_hash") or "").strip()
             title = (r.get("title") or "").strip()
 
-            # 1) URL 기준 중복 체크 (현재 배치 + 기존 DB)
+            # 1) URL 기준 중복 체크 (현재 배치 + 기존 Neon DB)
             if norm_url:
                 if norm_url in seen_urls_in_batch:
                     skipped += 1
                     continue
-                dst_cur.execute(
-                    "SELECT 1 FROM news_perspectives WHERE LOWER(TRIM(url)) = ? LIMIT 1;",
+                pg_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE LOWER(TRIM(url)) = %s LIMIT 1;",
                     (norm_url,),
                 )
-                if dst_cur.fetchone():
+                if pg_cur.fetchone():
                     seen_urls_in_batch.add(norm_url)
                     skipped += 1
                     continue
 
-            # 2) content_hash 기준 중복 체크 (URL이 다르거나 비어 있어도 동일 본문/기사 차단)
+            # 2) content_hash 기준 중복 체크
             if content_hash:
                 if content_hash in seen_hashes_in_batch:
                     skipped += 1
                     continue
-                dst_cur.execute(
-                    "SELECT 1 FROM news_perspectives WHERE content_hash = ? LIMIT 1;",
+                pg_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE content_hash = %s LIMIT 1;",
                     (content_hash,),
                 )
-                if dst_cur.fetchone():
+                if pg_cur.fetchone():
                     seen_hashes_in_batch.add(content_hash)
                     skipped += 1
                     continue
 
             # 3) URL도 해시도 없을 때 제목 기준 중복 체크
             if not norm_url and not content_hash and title:
-                dst_cur.execute(
-                    "SELECT 1 FROM news_perspectives WHERE TRIM(title) = ? LIMIT 1;",
+                pg_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE TRIM(title) = %s LIMIT 1;",
                     (title,),
                 )
-                if dst_cur.fetchone():
+                if pg_cur.fetchone():
                     skipped += 1
                     continue
 
@@ -526,8 +526,8 @@ def sync_sqlite_to_postgres(
                 skipped += 1
                 continue
 
-            cat_id = _get_or_create_sqlite_category(dst_cur, r.get("category_name"))
-            src_id = _get_or_create_sqlite_source(dst_cur, r.get("source_name"))
+            cat_id = _get_or_create_pg_category(pg_cur, r.get("category_name"))
+            src_id = _get_or_create_pg_source(pg_cur, r.get("source_name"))
             issue_data = (
                 {
                     "issue_title": r.get("issue_title"),
@@ -541,22 +541,23 @@ def sync_sqlite_to_postgres(
                 if r.get("issue_title") or r.get("issue_hash")
                 else None
             )
-            issue_id = _get_or_create_sqlite_issue(dst_cur, issue_data, cat_id)
-            meta_json = json.dumps(_parse_json_obj(r.get("metadata")), ensure_ascii=False)
+            issue_id = _get_or_create_pg_issue(pg_cur, issue_data, cat_id)
+            meta_obj = _parse_json_obj(r.get("metadata"))
 
-            dst_cur.execute(
+            pg_cur.execute(
                 """
-                INSERT OR IGNORE INTO news_perspectives (
+                INSERT INTO news_perspectives (
                     issue_id, source_id, title, author_name, url,
                     summary_facts, author_opinion, stance_type, raw_content,
                     content_hash, thumbnail_url, processing_status,
                     model_version, metadata, published_at, created_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?
-                );
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, COALESCE(%s, CURRENT_TIMESTAMP)
+                )
+                ON CONFLICT (url) DO NOTHING;
                 """,
                 (
                     issue_id,
@@ -572,12 +573,12 @@ def sync_sqlite_to_postgres(
                     r.get("thumbnail_url"),
                     r.get("processing_status") or "COMPLETED",
                     r.get("model_version"),
-                    meta_json,
-                    r.get("published_at"),
-                    r.get("created_at"),
+                    Json(meta_obj),
+                    _parse_timestamp(r.get("published_at")),
+                    _parse_timestamp(r.get("created_at")),
                 ),
             )
-            if dst_cur.rowcount and dst_cur.rowcount > 0:
+            if pg_cur.rowcount and pg_cur.rowcount > 0:
                 inserted += 1
                 if norm_url:
                     seen_urls_in_batch.add(norm_url)
@@ -585,6 +586,7 @@ def sync_sqlite_to_postgres(
                     seen_hashes_in_batch.add(content_hash)
             else:
                 skipped += 1
+
         pg_conn.commit()
         return {
             "status": "ok",
@@ -687,41 +689,41 @@ def sync_postgres_to_sqlite(
             content_hash = (r.get("content_hash") or "").strip()
             title = (r.get("title") or "").strip()
 
-            # 1) URL 기준 중복 체크 (현재 배치 + 기존 DB)
+            # 1) URL 기준 중복 체크 (현재 배치 + 기존 SQLite DB)
             if norm_url:
                 if norm_url in seen_urls_in_batch:
                     skipped += 1
                     continue
-                pg_cur.execute(
-                    "SELECT 1 FROM news_perspectives WHERE LOWER(TRIM(url)) = %s LIMIT 1;",
+                sq_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE LOWER(TRIM(url)) = ? LIMIT 1;",
                     (norm_url,),
                 )
-                if pg_cur.fetchone():
+                if sq_cur.fetchone():
                     seen_urls_in_batch.add(norm_url)
                     skipped += 1
                     continue
 
-            # 2) content_hash 기준 중복 체크 (URL이 다르거나 비어 있어도 동일 본문/기사 차단)
+            # 2) content_hash 기준 중복 체크
             if content_hash:
                 if content_hash in seen_hashes_in_batch:
                     skipped += 1
                     continue
-                pg_cur.execute(
-                    "SELECT 1 FROM news_perspectives WHERE content_hash = %s LIMIT 1;",
+                sq_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE content_hash = ? LIMIT 1;",
                     (content_hash,),
                 )
-                if pg_cur.fetchone():
+                if sq_cur.fetchone():
                     seen_hashes_in_batch.add(content_hash)
                     skipped += 1
                     continue
 
             # 3) URL도 해시도 없을 때 제목 기준 중복 체크
             if not norm_url and not content_hash and title:
-                pg_cur.execute(
-                    "SELECT 1 FROM news_perspectives WHERE TRIM(title) = %s LIMIT 1;",
+                sq_cur.execute(
+                    "SELECT 1 FROM news_perspectives WHERE TRIM(title) = ? LIMIT 1;",
                     (title,),
                 )
-                if pg_cur.fetchone():
+                if sq_cur.fetchone():
                     skipped += 1
                     continue
 
@@ -729,8 +731,8 @@ def sync_postgres_to_sqlite(
                 skipped += 1
                 continue
 
-            cat_id = _get_or_create_pg_category(pg_cur, r.get("category_name"))
-            src_id = _get_or_create_pg_source(pg_cur, r.get("source_name"))
+            cat_id = _get_or_create_sqlite_category(sq_cur, r.get("category_name"))
+            src_id = _get_or_create_sqlite_source(sq_cur, r.get("source_name"))
             issue_data = (
                 {
                     "issue_title": r.get("issue_title"),
@@ -744,23 +746,27 @@ def sync_postgres_to_sqlite(
                 if r.get("issue_title") or r.get("issue_hash")
                 else None
             )
-            issue_id = _get_or_create_pg_issue(pg_cur, issue_data, cat_id)
-            meta_obj = _parse_json_obj(r.get("metadata"))
+            issue_id = _get_or_create_sqlite_issue(sq_cur, issue_data, cat_id)
+            meta_json = json.dumps(_parse_json_obj(r.get("metadata")), ensure_ascii=False)
 
-            pg_cur.execute(
+            pub_at = r.get("published_at")
+            pub_at_str = pub_at.isoformat() if isinstance(pub_at, datetime) else (str(pub_at) if pub_at else None)
+            crt_at = r.get("created_at")
+            crt_at_str = crt_at.isoformat() if isinstance(crt_at, datetime) else (str(crt_at) if crt_at else None)
+
+            sq_cur.execute(
                 """
-                INSERT INTO news_perspectives (
+                INSERT OR IGNORE INTO news_perspectives (
                     issue_id, source_id, title, author_name, url,
                     summary_facts, author_opinion, stance_type, raw_content,
                     content_hash, thumbnail_url, processing_status,
                     model_version, metadata, published_at, created_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s, COALESCE(%s, CURRENT_TIMESTAMP)
-                )
-                ON CONFLICT (url) DO NOTHING;
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?
+                );
                 """,
                 (
                     issue_id,
@@ -776,12 +782,12 @@ def sync_postgres_to_sqlite(
                     r.get("thumbnail_url"),
                     r.get("processing_status") or "COMPLETED",
                     r.get("model_version"),
-                    Json(meta_obj),
-                    _parse_timestamp(r.get("published_at")),
-                    _parse_timestamp(r.get("created_at")),
+                    meta_json,
+                    pub_at_str,
+                    crt_at_str,
                 ),
             )
-            if pg_cur.rowcount and pg_cur.rowcount > 0:
+            if sq_cur.rowcount and sq_cur.rowcount > 0:
                 inserted += 1
                 if norm_url:
                     seen_urls_in_batch.add(norm_url)
@@ -815,7 +821,6 @@ def sync_postgres_to_sqlite(
         sq_conn.close()
         pg_cur.close()
         pg_conn.close()
-
 
 def _known_press_prefixes() -> Set[str]:
     names: Set[str] = set()
