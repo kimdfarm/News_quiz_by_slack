@@ -1,0 +1,247 @@
+{
+  "schema_version": "1.0",
+  "topic": "IT",
+  "created_at": "2026-11-28T20:22:35.808023",
+  "updated_at": "2026-11-28T23:16:21.040786",
+  "records": [
+    {
+      "title": "IT 정책·규제에 대한 언론별 시각 비교",
+      "passage": "2024년 초, 미국 의회와 연방 규제기관은 대형 기술 기업들의 시장 지배력과 데이터 활용에 대한 새로운 규제안을 논의하고 있다. 주요 언론들은 이 논의를 각각 다른 관점에서 보도하고 있다.\n\n- **The New York Times** – ‘U.S. Senate debates big‑tech antitrust bill’\n  - 기사에서는 소비자 보호와 공정 경쟁을 강조하며, 기존 독점 관행이 혁신을 저해하고 중소기업 진입 장벽을 높인다고 주장한다. 규제의 필요성을 강조하고, 입법이 성공하면 시장 다변화와 데이터 투명성이 향상될 것이라고 전망한다.\n\n- **The Wall Street Journal** – ‘Cloud‑computing costs rise as giants tighten contracts’\n  - 이 보도는 규제가 기업의 비용 구조와 투자 전략에 미칠 재정적 영향을 중심으로 다룬다. 규제 강화가 클라우드 서비스 가격 상승과 계약 조건 강화로 이어져 기업 고객에게 부담을 줄 수 있다고 경고한다. 또한, 과도한 규제가 미국 기업의 글로벌 경쟁력을 약화시킬 위험을 제기한다.\n\n- **TechCrunch** – ‘Start‑ups rally for clearer AI data rules’\n  - 스타트업 관점에서 규제의 필요성을 강조한다. 현재 데이터 사용에 대한 불명확한 규정이 혁신을 저해하고, 대기업과의 경쟁에서 불리하게 만든다고 지적한다. 명확하고 일관된 규제가 오히려 신생 기업에게 기회를 제공하고, 책임 있는 AI 개발을 촉진할 수 있다고 주장한다.\n\n위 세 기사에서 제시된 핵심 논점과 한계를 비교하고, 어느 관점이 현재 IT 정책 논쟁에서 가장 핵심적인 문제를 포괄적으로 다루고 있는지 평가하라.",
+      "source_excerpts": [
+        {
+          "source": "The New York Times – ‘U.S. Senate debates big‑tech antitrust bill’",
+          "summary": "소비자 보호와 공정 경쟁을 강조, 규제 필요성 주장, 시장 다변화와 데이터 투명성 기대"
+        }
+      ],
+      "questions": [
+        {
+          "number": 1,
+          "stem": "위 세 언론이 제시한 IT 정책·규제 논쟁에 대한 관점을 비교하라. 각 기사에서 강조하는 핵심 논점과 그 한계를 서술하고, 현재 미국 내 IT 정책 논쟁에서 가장 핵심적인 문제를 포괄적으로 다루고 있다고 판단되는 관점을 선택하여 그 이유를 논증하라.",
+          "box_example": null,
+          "choices": [],
+          "answer_indices": [],
+          "answer": "The New York Times의 관점이 가장 핵심적인 문제를 포괄적으로 다룬다. 이유는 (1) 규제의 근본 목적을 소비자 보호와 공정 경쟁이라는 넓은 가치 차원에서 제시함으로써 단순 비용·투자 효과를 넘어 시장 구조 전반을 조명한다. (2) 독점 관행이 혁신을 저해한다는 점을 강조해, 규제가 장기적인 기술 발전과 사회적 이익에 미치는 영향을 고려한다. 반면 Wall Street Journal은 규제의 재정적 부작용에 초점을 맞추어 단기적 비용 상승에만 주목하고, 규제 자체가 가져올 구조적 변화를 충분히 논의하지 않는다. TechCrunch는 스타트업 입장에서 규제의 필요성을 강조하지만, 규제가 전체 시장에 미치는 광범위한 경쟁·소비자 효과를 다루지 못한다. 따라서 NYT가 제시한 소비자·경쟁 중심의 프레임이 현재 정책 논쟁에서 가장 핵심적인 문제를 포괄한다.",
+          "explanation": "답변은 각 기사별 핵심 논점(소비자 보호·공정 경쟁, 비용·투자 영향, 스타트업 혁신)과 한계(범위 제한, 단기·편향적 시각, 부분적 초점)를 명확히 구분해야 한다. 이후 가장 포괄적인 관점을 선택하고, 선택 근거를 정책 목표·시장 구조·장기·단기 효과 등 다각도로 논증하면 정답으로 인정된다.",
+          "num_choices": 0,
+          "num_correct": 0,
+          "answer_index": null
+        }
+      ],
+      "rubric": [
+        "각 언론이 강조한 핵심 논점을 정확히 서술했는가 (각 1점, 총 3점).",
+        "각 관점의 한계를 비판적으로 제시했는가 (각 1점, 총 3점).",
+        "가장 포괄적인 관점을 선정하고, 선택 이유를 정책 목표·시장 구조·단기·장기 효과 등을 근거로 논증했는가 (5점)."
+      ],
+      "is_essay": true,
+      "quiz_id": "quiz_8e9c1fb3e9",
+      "topic": "IT",
+      "question_type": "multi_perspective",
+      "source_display_limit": 1,
+      "design_plan": {
+        "is_essay": true,
+        "display_article_count": 1,
+        "angle": "핵심 쟁점과 상반된 관점·한계점을 비교하며 논거를 제시하도록 출제",
+        "reasoning": "문항 성격과 확보 기사 수에 맞춰 동적 산정"
+      },
+      "llm_rule": "",
+      "source_count": 0,
+      "rag_relevance_ok": false,
+      "rag_warning": "'IT' 주제와 직접 관련된 기사를 찾지 못했습니다.",
+      "quality_report": {
+        "passed": true,
+        "score": 0.95,
+        "feedback": "문항이 서술형으로 적절히 구성되어 있으며 선택형 요소가 없고, 지문과 요구사항이 논리적으로 일치합니다. 정답과 해설이 질문에 정확히 대응하고 있어 품질이 우수합니다."
+      },
+      "langsmith": {
+        "project_name": "quiz-IT-a1bb",
+        "attempts": 1,
+        "rag_retries": 2
+      },
+      "saved_at": "2026-11-28T20:22:36.139021",
+      "slack": {
+        "channel_id": "C0C5QEAQYBH",
+        "thread_ts": "1795864956.068929"
+      }
+    },
+    {
+      "title": "클라우드 보안 서비스 출시와 주요 특징",
+      "passage": "국내 주요 클라우드 서비스 제공업체인 ‘클라우드X’는 2024년 4분기에 ‘Zero Trust’ 보안 모델을 적용한 새로운 서비스 ‘SecureEdge’를 출시했다고 발표했다. SecureEdge는 AI 기반 위협 탐지와 실시간 로그 분석 기능을 제공한다. 주요 특징으로는 (1) 사용자 인증을 다중 요소(MFA)로 강화하고, (2) 데이터 전송 시 엔드‑투‑엔드 암호화를 적용하며, (3) 클라우드 환경에서 자동으로 보안 정책을 적용하는 점을 들었다. 발표 자료에 따르면, 서비스 도입 기업의 70%가 보안 사고 감소 효과를 체감했다고 한다.",
+      "source_excerpts": [],
+      "questions": [
+        {
+          "number": 1,
+          "stem": "위 지문에 근거하여 ‘SecureEdge’ 서비스에 대한 설명으로 가장 옳은 것은?",
+          "box_example": null,
+          "choices": [
+            "① SecureEdge는 데이터 무결성을 보장하기 위해 블록체인 기술을 도입했다.",
+            "② SecureEdge는 AI 기반 위협 탐지와 실시간 로그 분석 기능을 제공한다.",
+            "③ SecureEdge는 다중 요소 인증을 없애고 단일 비밀번호만으로 인증한다.",
+            "④ SecureEdge는 온‑프레미스 데이터 센터 전용으로 설계되었다.",
+            "⑤ SecureEdge는 2022년에 처음 출시된 서비스이다."
+          ],
+          "answer_indices": [
+            2
+          ],
+          "answer": "② SecureEdge는 AI 기반 위협 탐지와 실시간 로그 분석 기능을 제공한다.",
+          "explanation": "지문에서 ‘SecureEdge는 AI 기반 위협 탐지와 실시간 로그 분석 기능을 제공한다’고 명시하고 있다. 다른 선택지는 지문에 언급되지 않았거나, 오히려 반대되는 내용(블록체인 도입, MFA 제거, 온‑프레미스 전용, 2022년 출시)이다.",
+          "num_choices": 5,
+          "num_correct": 1,
+          "answer_index": 2
+        }
+      ],
+      "rubric": [
+        "① 지문에 제시된 ‘AI 기반 위협 탐지와 실시간 로그 분석’이라는 핵심 기능을 정확히 파악했는가?",
+        "② 다른 선택지들이 지문 내용과 어떻게 어긋나는지 설명할 수 있는가?"
+      ],
+      "is_essay": false,
+      "quiz_id": "quiz_600f7d2d2a",
+      "topic": "IT",
+      "question_type": "csat_passage_set",
+      "source_display_limit": 1,
+      "design_plan": {
+        "is_essay": false,
+        "display_article_count": 1,
+        "angle": "제시된 기사 근거를 바탕으로 핵심 원리와 적용 사례를 분석하도록 출제",
+        "reasoning": "문항 성격과 확보 기사 수에 맞춰 동적 산정"
+      },
+      "llm_rule": "",
+      "source_count": 0,
+      "rag_relevance_ok": false,
+      "rag_warning": "'IT' 주제와 직접 관련된 기사를 찾지 못했습니다.",
+      "quality_report": {
+        "passed": true,
+        "score": 0.8,
+        "feedback": "양호"
+      },
+      "langsmith": {
+        "project_name": "quiz-IT-8aa2",
+        "attempts": 1,
+        "rag_retries": 2
+      },
+      "saved_at": "2026-11-28T20:43:52.826235",
+      "slack": {
+        "channel_id": "C0C5QEAQYBH",
+        "thread_ts": "1795866232.778489"
+      }
+    },
+    {
+      "title": "클라우드 보안 서비스 출시와 주요 특징",
+      "passage": "Amazon Web Services (AWS) recently announced the general availability of GuardDuty for containers, a managed threat detection service that continuously monitors container workloads running on Amazon Elastic Kubernetes Service (EKS) and Amazon Elastic Container Service (ECS). The service leverages machine‑learning models and anomaly detection to identify suspicious activity such as credential theft, privilege escalation, and communication with known malicious IP addresses. GuardDuty for containers integrates with existing GuardDuty findings, allowing customers to view container‑specific alerts alongside traditional EC2 and VPC findings in a single console. AWS also introduced automated remediation actions through AWS Security Hub and AWS Lambda, enabling customers to trigger predefined response workflows when high‑severity alerts are generated. According to AWS, the new capability reduces the time required to detect and respond to container‑related threats from hours to minutes, and it does not require any additional agents to be installed on the workloads.",
+      "source_excerpts": [
+        {
+          "source": "AWS 공식 블로그 – “Amazon GuardDuty for containers” 출시",
+          "summary": "AWS가 컨테이너 환경(EKS·ECS)용 위협 탐지 서비스 GuardDuty for containers를 정식 출시했으며, 머신러닝 기반 이상 탐지, 기존 GuardDuty와 통합된 콘솔, Lambda 기반 자동 대응 등을 제공한다는 내용."
+        }
+      ],
+      "questions": [
+        {
+          "number": 1,
+          "stem": "위 지문에 따르면 Amazon GuardDuty for containers의 특징으로 **언급되지 않은** 것은 무엇입니까?",
+          "box_example": null,
+          "choices": [
+            "① 머신러닝 모델을 활용해 이상 행동을 탐지한다.",
+            "② 각 컨테이너에 별도의 에이전트를 설치해야 한다.",
+            "③ 기존 GuardDuty와 통합된 콘솔에서 컨테이너와 EC2·VPC 경고를 함께 확인할 수 있다.",
+            "④ 고위험 경고 발생 시 AWS Lambda를 이용해 자동 대응 워크플로를 실행한다.",
+            "⑤ Amazon EKS와 Amazon ECS에서 실행되는 워크로드를 모니터링한다."
+          ],
+          "answer_indices": [
+            2
+          ],
+          "answer": "② 각 컨테이너에 별도의 에이전트를 설치해야 한다.",
+          "explanation": "지문에서는 ‘추가 에이전트를 설치할 필요가 없다’고 명시하고 있다. 따라서 에이전트 설치가 필요하다는 ②번은 지문에 언급되지 않은 내용이며, 나머지 선택지는 모두 지문에 기술된 특징이다.",
+          "num_choices": 5,
+          "num_correct": 1,
+          "answer_index": 2
+        }
+      ],
+      "rubric": [
+        "정답 선택 여부: ①점 (정답인 ②번을 선택하면 1점)",
+        "오답 선택 시 감점 없음 (오답 선택 시 0점)",
+        "해설을 근거로 답을 설명할 수 있는지 여부는 채점에 반영되지 않음"
+      ],
+      "is_essay": false,
+      "quiz_id": "quiz_af92f21468",
+      "topic": "IT",
+      "question_type": "csat_passage_set",
+      "source_display_limit": 1,
+      "design_plan": {
+        "is_essay": false,
+        "display_article_count": 1,
+        "angle": "제시된 기사 근거를 바탕으로 핵심 원리와 적용 사례를 분석하도록 출제",
+        "reasoning": "문항 성격과 확보 기사 수에 맞춰 동적 산정"
+      },
+      "llm_rule": "",
+      "source_count": 0,
+      "rag_relevance_ok": false,
+      "rag_warning": "제시된 기사(인덱스 0)는 전승희 씨의 부친상에 관한 부고이며, IT 기술이나 IT 산업과 직접적인 연관성이 없습니다. 기사 내용이 IT 뉴스라기보다 개인적인 사망 소식에 초점을 맞추고 있어 요청 주제와 부합하지 않습니다.",
+      "quality_report": {
+        "passed": true,
+        "score": 0.8,
+        "feedback": "양호"
+      },
+      "langsmith": {
+        "project_name": "quiz-IT-8a44",
+        "attempts": 1,
+        "rag_retries": 2
+      },
+      "saved_at": "2026-11-28T20:54:49.409193",
+      "slack": {
+        "channel_id": "C0C5QEAQYBH",
+        "thread_ts": "1795866889.379729"
+      }
+    },
+    {
+      "title": "IT 분석 과제",
+      "passage": "[1] (매경/기업_경영) 계약부터 회수까지 데이터로 검증…프리핀스, 핀테크 위크서 ‘ABFI’ 공개\n    사실: 프리핀스는 ‘코리아 핀테크 위크 2026’에서 ‘ABFI’ 플랫폼을 공개한다. ABFI는 실물자산(로봇, 장비, 모빌리티 등)의 계약부터 회수까지 전 과정을 데이터로 검증하는 금융 인프라다. 기업용 BMS, 금융기관용 RMS, 투자자용 FMS 체계로 구성되어 자산 생성 단계부터 상환에 이르기까지 모든 과정을 데이터 흐름으로 연결한다.\n    관점(긍정): 프리핀스의 ABFI 플랫폼은 실물자산 금융의 한계를 데이터 기반으로 해결하며, 금융기관의 참여를 돕고 자금 조달 병목 현상을 해소할 잠재력을 보여준다. 서울대기술지주와의 투자 협약과 기술력 증명 노력은 향후 혁신적인 금융 인프라의 발전 가능성을 시사한다.\n[2] (매경/기업_경영) AI 가전 시대 수리 끝판왕은?… 삼성전자서비스 경진대회\n    사실: 삼성전자서비스가 AI 가전 시대에 맞춰 기술경진대회를 개최하여 엔지니어의 수리 및 스마트싱스 활용 역량을 평가하고 있다. 이번 대회는 안전 문화 확산과 함께 AI 기반 서비스 혁신 사례를 발굴하는 데 중점을 두고 있으며, 우수 엔지니어에게는 고용부 장관상 등이 수여된다. 특히, 교통사고 및 근골격계 질환 예방을 위한 특별 종목 운영을 통해 안전 관리 시스템 강화에 힘쓰고 있다.\n    관점(긍정): 삼성전자서비스의 기술경진대회 개최는 AI 가전 시대에 발맞춰 서비스 엔지니어의 전문성을 강화하고 안전 문화를 확산하는 데 중요한 기회를 제공한다. 특히, 스마트싱스 연계 AI 활용 능력과 안전 관리 시",
+      "questions": [
+        {
+          "number": 1,
+          "stem": "{\n  \"title\": \"IT 혁신 사례 비교·비판\",\n  \"passage\": \"2026년 한국 IT·핀테크·가전 분야에서는 두 가지 주요 혁신이 주목받고 있다. 첫째, 프리핀스는 코리아 핀테크 위크에서 실물자산(로봇·장비·모빌리티 등)의 계약부터 회수까지 전 과정을 데이터로 검증하는 ‘ABFI’ 플랫폼을 공개했다. ABFI는 기업용 BMS, 금융기관용 RMS, 투자자용 FMS 체계로 구성돼 자산 생성‑상환 전 과정을 데이터 흐름으로 연결한다. 둘째, 삼성전자서비스는 AI 가전 시대에 맞춰 엔지니어의 수리·스마트싱스 활용 역량을 평가하는 기술경진대회를 개최했다. 대회는 AI 기반 서비스 혁신 사례 발굴, 안전 문화 확산, 교통·근골격계 질환 예방을 위한 특별 종목 운영 등을 목표로 한다. 두 사례 모두 데이터·AI를 핵심으로 하지만 적용 영역·목표·잠재적 한계가 다르다.\",\n  \"source_excerpts\": [\n    {\n      \"source\": \"매경/기업_경영 - 계약부터 회수까지 데이터로 검증…프리핀스, 핀테크 위크서 ‘ABFI’ 공개\",\n      \"summary\": \"프리핀스는 실물자산 금융 전 과정을 데이터로 검증하는 ABFI 플랫폼을 발표했다. 기업용 BMS·금융기관용 RMS·투자자용 FMS로 구성돼 자산 생성‑상환을 데이터 흐름으로 연결한다.\"\n    },\n    {\n      \"source\": \"매경/기업_경영 - AI 가전 시대 수리 끝판왕은?… 삼성전자서비스 경진대회\",\n      \"summary\": \"삼성전자서비스는 AI 가전 시대에 맞춰 엔지니어 역량을 평가하는 기술경진대회를 열었다. AI·스마트싱스 활용, 안전 문화 확산, 교통·근골격계 질환 예방을 위한 종목을 포함한다.\"\n    }\n  ],\n  \"questions\": [\n    {\n      \"number\": 1,\n      \"stem\": \"① 프리핀스의 ABFI 플랫폼과 ② 삼성전자서비스의 AI 기술경진대회를 각각 ‘핵심 쟁점’과 ‘주요 근거’를 들어 설명하고, 두 사례가 IT·산업 전반에 미치는 파급 효과를 비교하라. \\n\\n※ 체크리스트\\n- 각 사례의 핵심 쟁점(데이터 검증·금융 인프라 vs AI 서비스·안전 문화)을 정확히 제시했는가?\\n- 기사에 제시된 사실(플랫폼 구성·대회 목적·수상·안전 종목 등)과 일치하는 주장만 사용했는가?\\n- 두 사례의 장점·한계(규제·채택·스케일링 등)를 논리적으로 연결해 비교·판단했는가?\\n\\n※ 힌트 단계\\n1. ABFI: 데이터 흐름·BMS·RMS·FMS가 무엇을 의미하는지, 실물자산 금융의 기존 문제점(자금 조달 병목·투명성 부족)을 어떻게 해결하려 하는지 정리한다.\\n2. 삼성 대회: AI·스마트싱스 활용 역량, 안전 문화 확대, 교통·근골격계 질환 예방이라는 구체적 목표를 파악한다.\\n3. 파급 효과 비교: 금융·핀테크 영역 vs 가전·서비스 영역에서 각각 기대되는 산업 변화(금융기관 참여 확대·데이터 기반 신상품 vs 서비스 품질·고객 신뢰·안전 표준)와 공통적인 한계(규제·표준화·시장 수용성)를 도출한다.\",\n      \"box_example\": null,\n      \"choices\": [],\n      \"answer_indices\": [1],\n      \"answer\": \"프리핀스의 ABFI는 실물자산(로봇·장비·모빌리티 등)의 계약·회수 전 과정을 데이터로 검증하는 금융 인프라이다. 기업용 BMS, 금융기관용 RMS, 투자자용 FMS라는 3계층 구조를 통해 자산 생성‑상환을 투명한 데이터 흐름으로 연결함으로써 기존 실물자산 금융의 ‘투명성 부족’·‘자금 조달 병목’ 문제를 해결하려는 것이 핵심 쟁점이다. 이 플랫폼은 데이터 기반 신용평가·리스크 관리가 가능해 금융기관의 참여를 촉진하고, 투자자에게는 실물자산에 대한 신뢰성을 제공한다. 그러나 한계로는 금융 규제(자산유동화·디지털 자산 규제)와 데이터 표준화·보안 문제가 있다.\\n\\n삼성전자서비스의 AI 기술경진대회는 AI·스마트싱스 활용 역량을 평가해 서비스 엔지니어의 전문성을 강화하고, 안전 문화(교통·근골격계 질환 예방) 확산을 목표로 한다",
+          "box_example": null,
+          "choices": [],
+          "answer_indices": [],
+          "answer": "참고 기사의 핵심 쟁점 및 근거 반영",
+          "explanation": "기사 본문 근거 확인",
+          "num_choices": 0,
+          "num_correct": 0,
+          "answer_index": null
+        }
+      ],
+      "rubric": [
+        "핵심 쟁점과 근거를 정확히 제시했는가",
+        "기사 사실과 모순되는 주장이 없는가",
+        "주장·비교·판단의 논리적 일관성이 있는가"
+      ],
+      "is_essay": true,
+      "quiz_id": "quiz_f15c94ecfd",
+      "topic": "IT",
+      "question_type": "custom_rubric_essay",
+      "source_display_limit": 2,
+      "design_plan": {
+        "is_essay": true,
+        "display_article_count": 2,
+        "angle": "핵심 쟁점과 상반된 관점·한계점을 비교하며 논거를 제시하도록 출제",
+        "reasoning": "문항 성격과 확보 기사 수에 맞춰 동적 산정"
+      },
+      "llm_rule": "",
+      "source_count": 2,
+      "rag_relevance_ok": true,
+      "quality_report": {
+        "passed": true,
+        "score": 0.8,
+        "feedback": "양호"
+      },
+      "langsmith": {
+        "project_name": "quiz-IT-143b",
+        "attempts": 1,
+        "rag_retries": 1
+      },
+      "saved_at": "2026-11-28T23:16:21.040786",
+      "slack": {
+        "channel_id": "C0C5QEAQYBH",
+        "thread_ts": "1795875381.134379"
+      }
+    }
+  ]
+}

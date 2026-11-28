@@ -23,6 +23,9 @@ from slack.quiz_handler import (
     handle_quiz_generate,
     handle_quiz_ui_submit,
     try_handle_quiz_thread_reply,
+    handle_quiz_essay_modal_open,
+    handle_quiz_essay_modal_submit,
+    
 )
 from slack.schedule_worker import (
     build_schedule_request_with_llm,
@@ -155,7 +158,16 @@ def handle_quiz_radio_select(ack):
 def handle_quiz_submit_button(ack, body, client):
     ack()
     handle_quiz_ui_submit(body=body, client=client)
+@app.action("quiz_essay_modal_open")
+def handle_essay_modal_open_action(ack, body, client):
+    ack()
+    handle_quiz_essay_modal_open(body=body, client=client)
 
+
+@app.view("quiz_essay_modal_submit")
+def handle_essay_modal_submit_view(ack, body, client):
+    ack()
+    handle_quiz_essay_modal_submit(body=body, client=client)
 
 
 @app.event("message")
