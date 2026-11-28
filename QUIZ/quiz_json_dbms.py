@@ -1,24 +1,21 @@
+import json
 import os
 import re
-import json
-import shutil
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
 def sanitize_topic_filename(topic: str) -> str:
-    cleaned = re.sub(r'[\\/*?:"<>|]+', "", topic).strip()
+    cleaned = re.sub(r'[\\/*?:"<>|]+', "", topic or "").strip()
     cleaned = re.sub(r"\s+", "_", cleaned)
     return cleaned[:60] or "general_quiz"
 
 
-class QuizJsonDBMS:
-    """
-    PROJECT/<문제주제>.json 파일을 SQLite DBMS처럼 관리하는 인코더/디코더 엔진
-    """
+class QuizProjectDBMS:
+    """PROJECT/<문제주제>.json 파일을 DBMS처럼 다루는 인코더/디코더 저장소"""
 
     def __init__(self, base_dir: str = "PROJECT"):
-        self.base_dir = base_dir
+        self.base_dir = os.path.abspath(base_dir)
         os.makedirs(self.base_dir, exist_ok=True)
         self.index_path = os.path.join(self.base_dir, "_index.json")
         if not os.path.exists(self.index_path):
@@ -35,24 +32,42 @@ class QuizJsonDBMS:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _topic_path(self, topic: str) -> str:
+    def topic_file_path(self, topic: str) -> str:
         return os.path.join(self.base_dir, f"{sanitize_topic_filename(topic)}.json")
 
-    # --- 1. INSERT / UPSERT (문제 저장 + LangSmith 메타데이터 기록) ---
-    def insert_quiz(
+    def _topic_path(self, topic: str) -> str:
+        return self.topic_file_path(topic)
+
+    def list_topics(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for fn in sorted(os.listdir(self.base_dir)):
+            if not fn.endswith(".json") or fn.startswith("_"):
+                continue
+            fp = os.path.join(self.base_dir, fn)
+            doc = self._read_json(fp)
+            out.append({
+                "file": fn,
+                "topic": doc.get("topic"),
+                "count": len(doc.get("records") or []),
+                "updated_at": doc.get("updated_at"),
+            })
+        return out
+
+    # --- 1. INSERT / UPSERT ---
+    def save_quiz(
         self,
         topic: str,
         quiz_record: Dict[str, Any],
         thread_ts: Optional[str] = None,
         channel_id: Optional[str] = None,
     ) -> str:
-        file_path = self._topic_path(topic)
+        file_path = self.topic_file_path(topic)
         now = datetime.now().isoformat()
 
         if os.path.exists(file_path):
-            db_doc = self._read_json(file_path)
+            doc = self._read_json(file_path)
         else:
-            db_doc = {
+            doc = {
                 "schema_version": "1.0",
                 "topic": topic,
                 "created_at": now,
@@ -65,29 +80,27 @@ class QuizJsonDBMS:
         if thread_ts:
             quiz_record["slack"] = {"channel_id": channel_id, "thread_ts": thread_ts}
 
-        # 동일 quiz_id가 있으면 덮어쓰고(UPSERT), 없으면 추가
         existing_idx = next(
-            (i for i, r in enumerate(db_doc["records"]) if r["quiz_id"] == quiz_id),
+            (i for i, r in enumerate(doc.get("records") or []) if r.get("quiz_id") == quiz_id),
             None,
         )
         if existing_idx is not None:
-            db_doc["records"][existing_idx] = quiz_record
+            doc["records"][existing_idx] = quiz_record
         else:
-            db_doc["records"].append(quiz_record)
+            doc.setdefault("records", []).append(quiz_record)
 
-        db_doc["updated_at"] = now
-        self._atomic_write(file_path, db_doc)
+        doc["updated_at"] = now
+        self._atomic_write(file_path, doc)
 
-        # 글로벌 인덱스 갱신 (스레드 답안 채점 시 O(1) 조회용)
         index_data = self._read_json(self.index_path)
-        index_data["quizzes"][quiz_id] = {
+        index_data.setdefault("quizzes", {})[quiz_id] = {
             "topic": topic,
             "file": os.path.basename(file_path),
             "question_type": quiz_record.get("question_type"),
-            "langsmith_project": quiz_record.get("langsmith", {}).get("project_name"),
+            "langsmith_project": (quiz_record.get("langsmith") or {}).get("project_name"),
         }
         if thread_ts:
-            index_data["threads"][thread_ts] = {
+            index_data.setdefault("threads", {})[str(thread_ts)] = {
                 "quiz_id": quiz_id,
                 "topic": topic,
                 "file": os.path.basename(file_path),
@@ -96,78 +109,117 @@ class QuizJsonDBMS:
         self._atomic_write(self.index_path, index_data)
         return file_path
 
-    # --- 2. SELECT (주제별 / 유형별 / 스레드별 디코딩 조회) ---
+    def insert_quiz(
+        self,
+        topic: str,
+        quiz_record: Dict[str, Any],
+        thread_ts: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> str:
+        return self.save_quiz(
+            topic=topic,
+            quiz_record=quiz_record,
+            thread_ts=thread_ts,
+            channel_id=channel_id,
+        )
+
+    # --- 2. SELECT ---
     def get_by_thread(self, thread_ts: str) -> Optional[Dict[str, Any]]:
         index_data = self._read_json(self.index_path)
-        meta = index_data["threads"].get(thread_ts)
+        meta = (index_data.get("threads") or {}).get(str(thread_ts))
         if not meta:
             return None
-        return self.get_by_quiz_id(meta["quiz_id"])
+        items = self.select_quizzes(topic=meta.get("topic"), quiz_id=meta.get("quiz_id"))
+        return items[0] if items else None
 
     def get_by_quiz_id(self, quiz_id: str) -> Optional[Dict[str, Any]]:
-        index_data = self._read_json(self.index_path)
-        meta = index_data["quizzes"].get(quiz_id)
-        if not meta:
-            return None
-        file_path = os.path.join(self.base_dir, meta["file"])
-        if not os.path.exists(file_path):
-            return None
-        db_doc = self._read_json(file_path)
-        return next((r for r in db_doc["records"] if r["quiz_id"] == quiz_id), None)
+        items = self.select_quizzes(quiz_id=quiz_id)
+        return items[0] if items else None
 
     def select_quizzes(
         self,
         topic: Optional[str] = None,
+        quiz_id: Optional[str] = None,
         question_type: Optional[str] = None,
         min_quality_score: float = 0.0,
     ) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        files = (
-            [self._topic_path(topic)]
-            if topic
-            else [
+        if topic:
+            paths = [self.topic_file_path(topic)]
+        else:
+            paths = [
                 os.path.join(self.base_dir, fn)
-                for fn in os.listdir(self.base_dir)
+                for fn in sorted(os.listdir(self.base_dir))
                 if fn.endswith(".json") and not fn.startswith("_")
             ]
-        )
-        for fp in files:
+
+        matched: List[Dict[str, Any]] = []
+        for fp in paths:
             if not os.path.exists(fp):
                 continue
             doc = self._read_json(fp)
-            for rec in doc.get("records", []):
-                q_score = rec.get("quality_report", {}).get("score", 1.0)
+            for rec in doc.get("records") or []:
+                if quiz_id and rec.get("quiz_id") != quiz_id:
+                    continue
                 if question_type and rec.get("question_type") != question_type:
                     continue
+                q_score = float(((rec.get("quality_report") or {}).get("score")) if rec.get("quality_report") is not None else 1.0)
                 if q_score < min_quality_score:
                     continue
-                results.append(rec)
-        return results
+                matched.append(rec)
+        return matched
 
-    # --- 3. DELETE (특정 문항 삭제 및 인덱스 정리) ---
+    # --- 3. DELETE ---
     def delete_quiz(self, quiz_id: str) -> bool:
         index_data = self._read_json(self.index_path)
-        meta = index_data["quizzes"].get(quiz_id)
+        meta = (index_data.get("quizzes") or {}).get(quiz_id)
         if not meta:
             return False
 
-        file_path = os.path.join(self.base_dir, meta["file"])
-        if os.path.exists(file_path):
-            doc = self._read_json(file_path)
-            doc["records"] = [r for r in doc["records"] if r["quiz_id"] != quiz_id]
+        fp = os.path.join(self.base_dir, meta["file"])
+        if os.path.exists(fp):
+            doc = self._read_json(fp)
+            doc["records"] = [
+                r for r in (doc.get("records") or []) if r.get("quiz_id") != quiz_id
+            ]
             doc["updated_at"] = datetime.now().isoformat()
-            self._atomic_write(file_path, doc)
+            self._atomic_write(fp, doc)
 
-        index_data["quizzes"].pop(quiz_id, None)
+        (index_data.get("quizzes") or {}).pop(quiz_id, None)
         index_data["threads"] = {
             ts: info
-            for ts, info in index_data["threads"].items()
-            if info["quiz_id"] != quiz_id
+            for ts, info in (index_data.get("threads") or {}).items()
+            if info.get("quiz_id") != quiz_id
         }
         self._atomic_write(self.index_path, index_data)
         return True
 
-    # --- 4. EXPORT / DOWNLOAD (수능형·문제집 PDF 생성기용 번들 디코딩 추출) ---
+    # --- 4. EXPORT / IMPORT ---
+    def export_bundle(
+        self,
+        export_path: str,
+        topics: Optional[List[str]] = None,
+        question_types: Optional[List[str]] = None,
+        template_style: str = "csat_2col",
+    ) -> str:
+        items: List[Dict[str, Any]] = []
+        target_topics = topics or [t["topic"] for t in self.list_topics() if t.get("topic")]
+        for t in target_topics:
+            for rec in self.select_quizzes(topic=t):
+                if question_types and rec.get("question_type") not in question_types:
+                    continue
+                items.append(rec)
+
+        bundle = {
+            "workbook_meta": {
+                "style": template_style,
+                "exported_at": datetime.now().isoformat(),
+                "total_items": len(items),
+            },
+            "items": items,
+        }
+        self._atomic_write(export_path, bundle)
+        return export_path
+
     def export_workbook_bundle(
         self,
         export_path: str,
@@ -175,48 +227,45 @@ class QuizJsonDBMS:
         question_types: Optional[List[str]] = None,
         template_style: str = "csat_2col",
     ) -> str:
-        selected: List[Dict[str, Any]] = []
-        target_topics = topics or [
-            fn[:-5]
-            for fn in os.listdir(self.base_dir)
-            if fn.endswith(".json") and not fn.startswith("_")
-        ]
-        for t in target_topics:
-            for rec in self.select_quizzes(topic=t):
-                if question_types and rec.get("question_type") not in question_types:
-                    continue
-                selected.append(rec)
+        return self.export_bundle(
+            export_path=export_path,
+            topics=topics,
+            question_types=question_types,
+            template_style=template_style,
+        )
 
-        bundle = {
-            "workbook_meta": {
-                "style": template_style,  # csat_2col(수능형) | standard_workbook(일반문제집)
-                "exported_at": datetime.now().isoformat(),
-                "total_items": len(selected),
-            },
-            "items": selected,
-        }
-        self._atomic_write(export_path, bundle)
-        return export_path
-
-    # --- 5. IMPORT / LOAD (외부 JSON 문제 파일 검증 후 복원/병합) ---
-    def import_from_json(self, external_json_path: str) -> int:
+    def import_bundle(self, external_json_path: str) -> int:
         raw = self._read_json(external_json_path)
-        # 단일 주제 DB 파일 형태 또는 export_workbook_bundle 형태 모두 디코딩 지원
-        items = raw.get("records") or raw.get("items") or []
-        topic = raw.get("topic") or os.path.splitext(os.path.basename(external_json_path))[0]
-
-        imported_count = 0
-        for item in items:
-            if "quiz_id" not in item or "question_type" not in item:
+        records = raw.get("records") or raw.get("items") or []
+        fallback_topic = raw.get("topic") or os.path.splitext(os.path.basename(external_json_path))[0]
+        count = 0
+        for rec in records:
+            if not isinstance(rec, dict) or not rec.get("quiz_id"):
                 continue
-            item_topic = item.get("topic") or topic
-            thread_ts = item.get("slack", {}).get("thread_ts")
-            channel_id = item.get("slack", {}).get("channel_id")
-            self.insert_quiz(
-                topic=item_topic,
-                quiz_record=item,
-                thread_ts=thread_ts,
-                channel_id=channel_id,
+            topic = rec.get("topic") or fallback_topic
+            slack_info = rec.get("slack") or {}
+            self.save_quiz(
+                topic=topic,
+                quiz_record=rec,
+                thread_ts=slack_info.get("thread_ts"),
+                channel_id=slack_info.get("channel_id"),
             )
-            imported_count += 1
-        return imported_count
+            count += 1
+        return count
+
+    def import_from_json(self, external_json_path: str) -> int:
+        return self.import_bundle(external_json_path)
+
+    def get_existing_summaries(self, limit: int = 20) -> List[str]:
+        summaries: List[str] = []
+        for rec in self.select_quizzes():
+            q_type = rec.get("question_type", "")
+            topic = rec.get("topic", "")
+            title = rec.get("title", "")
+            summaries.append(f"[{topic} | {q_type}] {title}")
+            if len(summaries) >= limit:
+                break
+        return summaries
+
+
+QuizJsonDBMS = QuizProjectDBMS

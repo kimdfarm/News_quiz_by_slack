@@ -6,11 +6,13 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage
 
 from QUIZ.quiz_engine import (
-    QuizProjectDBMS,
+    build_quiz_slack_blocks,
     format_quiz_for_slack,
     generate_and_save_quiz_with_graph,
     regenerate_quiz_from_record,
 )
+from QUIZ.quiz_json_dbms import QuizProjectDBMS
+from QUIZ.types import get_quiz_type_spec
 from slack.llm_router import (
     clean_str_arg,
     extract_json,
@@ -21,12 +23,97 @@ from slack.llm_router import (
 )
 from storage_backend import DEFAULT_SQLITE_PATH
 
-_PROJECT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "PROJECT")
+_PROJECT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "PROJECT",
+)
 quiz_dbms = QuizProjectDBMS(base_dir=_PROJECT_DIR)
+
+
+def _parse_n_m(user_text: str) -> tuple[int, int]:
+    csat_spec = get_quiz_type_spec("csat_passage_set")
+    parser = csat_spec.get("parse_n_m")
+    if callable(parser):
+        return parser(user_text, default_n=5, default_m=1)
+    return 5, 1
+
+
+def _fetch_from_neon_if_enabled(keyword: Optional[str], limit: int) -> Optional[List[Dict[str, Any]]]:
+    use_neon = (os.getenv("USE_NEON_QUIZ_DB") or "").strip().lower() in ("1", "true", "yes")
+    if not use_neon or not os.getenv("DATABASE_URL"):
+        return None
+    try:
+        from database import get_db_connection
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            sql = """
+                SELECT
+                    COALESCE(s.name, '기타언론') AS source,
+                    COALESCE(c.name, '종합') AS category,
+                    p.title,
+                    COALESCE(NULLIF(p.summary_facts, ''), i.representative_summary, i.issue_title, '') AS facts,
+                    COALESCE(p.author_opinion, '') AS opinion,
+                    COALESCE(p.stance_type, '중립') AS stance_type,
+                    p.author_name,
+                    p.url,
+                    COALESCE(p.published_at, i.published_at, p.created_at) AS pub_dt
+                FROM news_perspectives p
+                LEFT JOIN news_issues i ON i.id = p.issue_id
+                LEFT JOIN categories c ON c.id = i.category_id
+                LEFT JOIN sources s ON s.id = p.source_id
+                WHERE 1=1
+            """
+            params: List[Any] = []
+            if keyword and keyword.strip():
+                kw = f"%{keyword.strip()}%"
+                sql += """
+                    AND (
+                        c.name ILIKE %s
+                        OR i.issue_title ILIKE %s
+                        OR p.title ILIKE %s
+                        OR p.summary_facts ILIKE %s
+                        OR p.author_opinion ILIKE %s
+                        OR array_to_string(i.keywords, ',') ILIKE %s
+                    )
+                """
+                params.extend([kw, kw, kw, kw, kw, kw])
+
+            sql += " ORDER BY pub_dt DESC NULLS LAST, p.id DESC LIMIT %s;"
+            params.append(limit)
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            cols = [
+                "source",
+                "category",
+                "title",
+                "facts",
+                "opinion",
+                "stance_type",
+                "author_name",
+                "url",
+                "pub_dt",
+            ]
+            return [dict(zip(cols, r)) for r in rows]
+        finally:
+            cur.close()
+            conn.close()
+    except Exception as e:
+        print(f"[Quiz Neon 조회 실패, SQLite로 폴백]: {e}")
+        return None
 
 
 def fetch_articles_for_quiz(keyword: Optional[str], limit: int, mcp_tools: Any) -> List[Dict[str, Any]]:
     fetch_n = max(limit * 3, 15)
+
+    neon_articles = _fetch_from_neon_if_enabled(keyword=keyword, limit=fetch_n)
+    if neon_articles is not None:
+        if neon_articles:
+            return neon_articles[:limit]
+        fallback_all = _fetch_from_neon_if_enabled(keyword=None, limit=fetch_n) or []
+        return fallback_all[:limit]
+
     raw_res = mcp_tools.get_recent_news_for_quiz(
         category="전체",
         limit=fetch_n,
@@ -73,17 +160,103 @@ def _llm_for_quiz_graph(prompt: str, max_tokens: int) -> Optional[str]:
     )
 
 
+def _extract_choice_numbers(user_answer: str, max_choices: int) -> List[int]:
+    csat_spec = get_quiz_type_spec("csat_passage_set")
+    circle_nums = csat_spec.get("circle_nums") or ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"]
+    limit_n = max(1, min(int(max_choices or len(circle_nums)), len(circle_nums)))
+
+    s = (user_answer or "").strip()
+    found: List[int] = []
+    for idx, sym in enumerate(circle_nums[:limit_n], 1):
+        if sym in s and idx not in found:
+            found.append(idx)
+
+    for m in re.finditer(r"(?:^|[^\d])([1-9]|10)(?:\s*번|[^\d]|$)", s):
+        num = int(m.group(1))
+        if 1 <= num <= limit_n and num not in found:
+            found.append(num)
+
+    return sorted(found)
+
+
+def grade_multiple_choice_deterministic(
+    quiz_record: Dict[str, Any],
+    selected_indices: Optional[List[int]],
+    raw_user_text: str,
+    user_id: str,
+) -> str:
+    q = (quiz_record.get("questions") or [{}])[0]
+    choices = q.get("choices") or []
+    n_cnt = len(choices)
+    raw_ans_indices = q.get("answer_indices")
+    if isinstance(raw_ans_indices, list) and raw_ans_indices:
+        ans_indices = sorted({int(x) for x in raw_ans_indices if 1 <= int(x) <= n_cnt})
+    elif q.get("answer_index"):
+        ans_indices = [int(q["answer_index"])]
+    else:
+        ans_indices = [1] if n_cnt >= 1 else []
+
+    expected_m = int(q.get("num_correct") or len(ans_indices) or 1)
+    chosen_list = (
+        sorted({int(x) for x in selected_indices if 1 <= int(x) <= n_cnt})
+        if selected_indices is not None
+        else _extract_choice_numbers(raw_user_text, max_choices=n_cnt)
+    )
+
+    if not chosen_list:
+        return (
+            f"<@{user_id}> 선택하신 번호를 인식하지 못했어요. "
+            f"`1번`~`{n_cnt}번`({expected_m}개)으로 입력하거나 위 UI에서 선택 후 제출해 주세요."
+        )
+
+    chosen_labels = ", ".join(choices[i - 1] for i in chosen_list)
+    ans_labels = ", ".join(choices[i - 1] for i in ans_indices)
+    is_correct = chosen_list == ans_indices
+
+    if is_correct:
+        verdict = "⭕ *정답입니다!*"
+    elif len(chosen_list) != expected_m:
+        verdict = f"❌ *오답입니다.* (이 문항은 *{expected_m}개* 정답인데 *{len(chosen_list)}개*를 선택하셨습니다.)"
+    else:
+        verdict = "❌ *오답입니다.*"
+
+    lines = [
+        f"<@{user_id}> 님의 답을 *{chosen_labels}* (으)로 제출했습니다.",
+        f"• 판정: {verdict}",
+        f"• 정답({len(ans_indices)}개): *{ans_labels}*",
+    ]
+    if q.get("explanation"):
+        lines.append(f"• 해설: {q['explanation']}")
+    return "\n".join(lines)
+
+
 def _grade_thread_submission(quiz_record: Dict[str, Any], user_answer: str, user_id: str) -> str:
+    q = (quiz_record.get("questions") or [{}])[0]
+    choices = q.get("choices") or []
+    is_mc = bool(choices) and not bool(quiz_record.get("is_essay"))
+
+    if is_mc:
+        return grade_multiple_choice_deterministic(
+            quiz_record=quiz_record,
+            selected_indices=None,
+            raw_user_text=user_answer,
+            user_id=user_id,
+        )
+
     ls_project = (quiz_record.get("langsmith") or {}).get("project_name")
     if ls_project:
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_PROJECT"] = ls_project
 
+    rubric = quiz_record.get("rubric") or []
     prompt = (
-        "당신은 1문항 퀴즈 답안 참/거짓 및 루브릭 채점관입니다. JSON으로만 답하세요.\n"
-        f"문제 정보: {json.dumps(quiz_record, ensure_ascii=False)[:2500]}\n"
+        "당신은 서술형 퀴즈 루브릭 채점관입니다. JSON으로만 답하세요.\n"
+        "중요 규칙: is_true가 false이면 reason에 절대 '정답입니다', '일치합니다' 같은 표현을 쓰지 마세요.\n"
+        f"문항: {q.get('stem')}\n"
+        f"모범 핵심 요지: {q.get('answer')}\n"
+        f"채점 기준: {json.dumps(rubric, ensure_ascii=False)}\n"
         f"제출자(<@{user_id}>) 답안: {user_answer}\n\n"
-        '출력 형식: {"is_true": true, "score_text": "정답/충족", "reason": "판별 이유", "missing": []}'
+        '출력 형식: {"is_true": true, "score_text": "기준 충족/미충족", "reason": "판별 이유", "missing": []}'
     )
     raw = (
         invoke_llm_with_fallback(
@@ -99,7 +272,7 @@ def _grade_thread_submission(quiz_record: Dict[str, Any], user_answer: str, user
         m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         parsed = json.loads(m.group(0)) if m else {"is_true": False, "reason": raw.strip()}
 
-    verdict_label = "참 (정답/기준 충족)" if parsed.get("is_true") else "거짓 (오답/기준 미충족)"
+    verdict_label = "참 (기준 충족)" if parsed.get("is_true") else "거짓 (기준 미충족)"
     lines = [
         f"<@{user_id}> 답안 판별: *{verdict_label}* ({parsed.get('score_text', '')})",
         f"• 근거: {parsed.get('reason', '')}",
@@ -119,7 +292,11 @@ def _format_requested_quiz_extras(quiz_record: Dict[str, Any], req_text: str) ->
 
     parts: List[str] = []
     if want_sources:
-        disp_limit = int(quiz_record.get("source_display_limit") or len(quiz_record.get("source_excerpts") or []) or 1)
+        disp_limit = int(
+            quiz_record.get("source_display_limit")
+            or len(quiz_record.get("source_excerpts") or [])
+            or 1
+        )
         excerpts = (quiz_record.get("source_excerpts") or [])[:disp_limit]
         if excerpts:
             parts.append("*참고 기사 자료*")
@@ -162,7 +339,6 @@ def try_handle_quiz_thread_reply(thread_ts: str, answer_text: str, user_id: str,
 
 
 def _detect_regeneration_request(user_text: str, candidate_kw: Optional[str]) -> Optional[Dict[str, Any]]:
-    """'~~프로젝트에서 문제 객관식/서술형으로 새롭게 만들어줘' 같은 재탄생 요청을 판별합니다."""
     topics = quiz_dbms.list_topics()
     if not topics:
         return None
@@ -176,7 +352,15 @@ def _detect_regeneration_request(user_text: str, candidate_kw: Optional[str]) ->
         f"후보 키워드: {candidate_kw!r}\n"
         f"사용자 원문: {user_text!r}"
     )
-    parsed = extract_json(invoke_llm_with_fallback([HumanMessage(content=prompt)], temperature=0.0, max_tokens=150, prefer_local=True) or "")
+    parsed = extract_json(
+        invoke_llm_with_fallback(
+            [HumanMessage(content=prompt)],
+            temperature=0.0,
+            max_tokens=150,
+            prefer_local=True,
+        )
+        or ""
+    )
     if not parsed or not parsed.get("is_regen"):
         return None
 
@@ -184,7 +368,11 @@ def _detect_regeneration_request(user_text: str, candidate_kw: Optional[str]) ->
     matched_topic = None
     if raw_topic:
         for t_name in topic_names:
-            if t_name.lower() == raw_topic.lower() or raw_topic.lower() in t_name.lower() or t_name.lower() in raw_topic.lower():
+            if (
+                t_name.lower() == raw_topic.lower()
+                or raw_topic.lower() in t_name.lower()
+                or t_name.lower() in raw_topic.lower()
+            ):
                 matched_topic = t_name
                 break
         if not matched_topic:
@@ -205,14 +393,14 @@ def _detect_regeneration_request(user_text: str, candidate_kw: Optional[str]) ->
 
 
 def _post_and_bind_thread(result: Dict[str, Any], event: Dict[str, Any], say: Any) -> None:
-    posted = say(
-        text=format_quiz_for_slack(
-            result,
-            articles=result.get("articles"),
-            show_sources=False,
-            show_rubric=False,
-        )
+    fallback_text = format_quiz_for_slack(
+        result,
+        articles=result.get("articles"),
+        show_sources=False,
+        show_rubric=False,
     )
+    blocks = build_quiz_slack_blocks(result, show_sources=False, show_rubric=False)
+    posted = say(text=fallback_text, blocks=blocks)
     posted_data = getattr(posted, "data", posted) if posted is not None else {}
     thread_ts = None
     if isinstance(posted_data, dict):
@@ -237,10 +425,16 @@ def handle_quiz_generate(
     merged = unwrap_tool_args(chosen)
     candidate_kw = clean_str_arg(merged.get("keyword")) or clean_str_arg(merged.get("category"))
     q_type = clean_str_arg(merged.get("question_type"))
+    num_choices, num_correct = _parse_n_m(user_text)
 
     regen_info = _detect_regeneration_request(user_text, candidate_kw)
     if regen_info:
-        say(text="♻️ 기존 프로젝트 문제를 바탕으로 *독립된 새 문제*로 재탄생시키는 중이에요...")
+        say(
+            text=(
+                f"♻️ 기존 프로젝트 문제를 바탕으로 *독립된 새 문제*({num_choices}지선다·{num_correct}정답)로 "
+                "재탄생시키는 중이에요..."
+            )
+        )
         regen_result = regenerate_quiz_from_record(
             source_quiz=regen_info["source_quiz"],
             user_text=user_text,
@@ -248,6 +442,8 @@ def handle_quiz_generate(
             dbms=quiz_dbms,
             target_format=regen_info["target_format"],
             question_type=q_type,
+            num_choices=num_choices,
+            num_correct=num_correct,
         )
         _post_and_bind_thread(regen_result, event=event, say=say)
         return
@@ -266,7 +462,12 @@ def handle_quiz_generate(
         or 4
     )
 
-    say(text="🧠 Top-K 도구 라우팅 및 *LangGraph + LangSmith*로 1문항 퀴즈를 생성해 `PROJECT/`에 저장 중이에요...")
+    say(
+        text=(
+            f"🧠 Top-K 도구 라우팅 및 *LangGraph + LangSmith*로 1문항 퀴즈"
+            f"({num_choices}지선다·{num_correct}정답)를 생성해 `PROJECT/`에 저장 중이에요..."
+        )
+    )
     result = generate_and_save_quiz_with_graph(
         user_text=user_text,
         fetch_articles_fn=lambda kw, lim: fetch_articles_for_quiz(kw, lim, mcp_tools=mcp_tools),
@@ -277,6 +478,8 @@ def handle_quiz_generate(
         custom_rubric=rubric_list,
         llm_rule=llm_rule,
         limit=limit,
+        num_choices=num_choices,
+        num_correct=num_correct,
     )
     _post_and_bind_thread(result, event=event, say=say)
 
@@ -320,75 +523,8 @@ def handle_quiz_db_manage(event: Dict[str, Any], chosen: Dict[str, Any], say: An
 
     items = quiz_dbms.select_quizzes(topic=topic, quiz_id=quiz_id)
     say(text=f"🔎 조회 결과 `{len(items)}`건 (`topic={topic or '전체'}`)")
-    
-from QUIZ.quiz_engine import CIRCLE_NUMS, parse_n_m_from_text
 
 
-def _extract_choice_numbers(user_answer: str, max_choices: int) -> List[int]:
-    s = (user_answer or "").strip()
-    found: List[int] = []
-    for idx, sym in enumerate(CIRCLE_NUMS[:max_choices], 1):
-        if sym in s and idx not in found:
-            found.append(idx)
-
-    for m in re.finditer(r"(?:^|[^\d])([1-9]|10)(?:\s*번|[^\d]|$)", s):
-        num = int(m.group(1))
-        if 1 <= num <= max_choices and num not in found:
-            found.append(num)
-
-    return sorted(found)
-
-
-def grade_multiple_choice_deterministic(
-    quiz_record: Dict[str, Any],
-    selected_indices: Optional[List[int]],
-    raw_user_text: str,
-    user_id: str,
-) -> str:
-    q = (quiz_record.get("questions") or [{}])[0]
-    choices = q.get("choices") or []
-    n_cnt = len(choices)
-    raw_ans_indices = q.get("answer_indices")
-    if isinstance(raw_ans_indices, list) and raw_ans_indices:
-        ans_indices = sorted({int(x) for x in raw_ans_indices if 1 <= int(x) <= n_cnt})
-    elif q.get("answer_index"):
-        ans_indices = [int(q["answer_index"])]
-    else:
-        ans_indices = [1] if n_cnt >= 1 else []
-
-    expected_m = int(q.get("num_correct") or len(ans_indices) or 1)
-    chosen_list = (
-        sorted({int(x) for x in selected_indices if 1 <= int(x) <= n_cnt})
-        if selected_indices is not None
-        else _extract_choice_numbers(raw_user_text, max_choices=n_cnt)
-    )
-
-    if not chosen_list:
-        return (
-            f"<@{user_id}> 선택하신 번호를 인식하지 못했어요. "
-            f"`1번`~`{n_cnt}번`({expected_m}개)으로 입력하거나 위 UI에서 선택 후 제출해 주세요."
-        )
-
-    chosen_labels = ", ".join(choices[i - 1] for i in chosen_list)
-    ans_labels = ", ".join(choices[i - 1] for i in ans_indices)
-    is_correct = (chosen_list == ans_indices)
-
-    if is_correct:
-        verdict = "⭕ *정답입니다!*"
-    elif len(chosen_list) != expected_m:
-        verdict = f"❌ *오답입니다.* (이 문항은 *{expected_m}개* 정답인데 *{len(chosen_list)}개*를 선택하셨습니다.)"
-    else:
-        verdict = "❌ *오답입니다.*"
-
-    lines = [
-        f"<@{user_id}> 님의 답을 *{chosen_labels}* (으)로 제출했습니다.",
-        f"• 판정: {verdict}",
-        f"• 정답({len(ans_indices)}개): *{ans_labels}*",
-    ]
-    if q.get("explanation"):
-        lines.append(f"• 해설: {q['explanation']}")
-    return "\n".join(lines)    
-    
 def handle_quiz_ui_submit(body: Dict[str, Any], client: Any) -> None:
     user_id = (body.get("user") or {}).get("id") or "unknown"
     channel_id = (body.get("channel") or {}).get("id")
@@ -445,17 +581,3 @@ def handle_quiz_ui_submit(body: Dict[str, Any], client: Any) -> None:
         thread_ts=str(thread_ts),
         text=reply_text,
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
